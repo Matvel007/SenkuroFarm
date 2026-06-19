@@ -1534,11 +1534,16 @@ private fun InfoScreen(onOpenLicense: () -> Unit, modifier: Modifier = Modifier)
         item {
             SectionCard("Разработчик") {
                 Button(onClick = {
-                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/Matvel007")))
+                    context.startActivity(
+                        Intent(
+                            Intent.ACTION_VIEW,
+                            Uri.parse("https://github.com/Matvel007/SenkuroFarm")
+                        )
+                    )
                 }, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Rounded.OpenInNew, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("GitHub: Matvel007")
+                    Text("GitHub проекта")
                 }
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(onClick = onOpenLicense, modifier = Modifier.fillMaxWidth()) { Text("Лицензия") }
