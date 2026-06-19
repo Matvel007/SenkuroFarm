@@ -23,6 +23,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.Keep
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -182,7 +183,8 @@ private data class CardsPage(
 
 private data class CachedCardsPage(val page: CardsPage, val savedAt: Long)
 
-private class FarmWebBridge(
+@Keep
+internal class FarmWebBridge(
     private val mainHandler: Handler,
     private val onUrlChanged: (String) -> Unit
 ) {
@@ -1439,6 +1441,11 @@ private fun FarmSiteWebView(
         update = { webView ->
             webView.visibility = if (isVisible) View.VISIBLE else View.INVISIBLE
             webView.evaluateJavascript(farmReaderScript(false, delaySeconds), null)
+            webView.evaluateJavascript("location.href") { rawUrl ->
+                cleanJsString(rawUrl)
+                    .takeIf { it.startsWith("https://senkuro.me/") }
+                    ?.let(onUrlChanged)
+            }
             val backgroundUrl = farmProgress.url.takeIf {
                 it.startsWith("https://senkuro.me/") && "/chapters/" in it
             }
