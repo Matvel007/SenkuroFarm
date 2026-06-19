@@ -78,6 +78,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -213,10 +214,33 @@ private fun SenkuroFarmApp() {
     var shellReloadKey by remember { mutableIntStateOf(0) }
     var availableUpdate by remember { mutableStateOf<GithubRelease?>(null) }
     var pendingInstallPermission by remember { mutableStateOf<GithubRelease?>(null) }
-    var downloadRequest by remember { mutableStateOf<GithubRelease?>(null) }
     var checkingUpdate by remember { mutableStateOf(false) }
     var downloadingUpdate by remember { mutableStateOf(false) }
+    var updateDownloadedBytes by remember { mutableStateOf(0L) }
+    var updateTotalBytes by remember { mutableStateOf(0L) }
     var updateNotice by remember { mutableStateOf<String?>(null) }
+
+    val startUpdateDownload: (GithubRelease) -> Unit = { release ->
+        if (!downloadingUpdate) {
+            scope.launch {
+                downloadingUpdate = true
+                updateDownloadedBytes = 0L
+                updateTotalBytes = 0L
+                runCatching {
+                    AppUpdater.downloadAndVerify(context, release) { downloaded, total ->
+                        updateDownloadedBytes = downloaded
+                        updateTotalBytes = total
+                    }
+                }.onSuccess { apk ->
+                    availableUpdate = null
+                    AppUpdater.install(context, apk)
+                }.onFailure {
+                    updateNotice = "Не удалось установить обновление: ${it.message.orEmpty()}"
+                }
+                downloadingUpdate = false
+            }
+        }
+    }
 
     val unknownSourcesLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -224,7 +248,7 @@ private fun SenkuroFarmApp() {
         val release = pendingInstallPermission
         pendingInstallPermission = null
         if (release != null && AppUpdater.canInstallPackages(context)) {
-            downloadRequest = release
+            startUpdateDownload(release)
         } else if (release != null) {
             updateNotice = "Без разрешения на установку приложений обновление невозможно."
         }
@@ -235,21 +259,6 @@ private fun SenkuroFarmApp() {
             .onSuccess { release ->
                 if (release != null) availableUpdate = release
             }
-    }
-
-    LaunchedEffect(downloadRequest) {
-        val release = downloadRequest ?: return@LaunchedEffect
-        downloadRequest = null
-        downloadingUpdate = true
-        runCatching { AppUpdater.downloadAndVerify(context, release) }
-            .onSuccess { apk ->
-                availableUpdate = null
-                AppUpdater.install(context, apk)
-            }
-            .onFailure {
-                updateNotice = "Не удалось установить обновление: ${it.message.orEmpty()}"
-            }
-        downloadingUpdate = false
     }
 
     MaterialTheme(colorScheme = if (darkTheme) darkScheme else lightScheme) {
@@ -341,13 +350,29 @@ private fun SenkuroFarmApp() {
                                     .verticalScroll(rememberScrollState())
                             )
                             if (downloadingUpdate) {
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    CircularProgressIndicator(modifier = Modifier.size(22.dp))
-                                    Text("Загрузка и проверка APK…")
+                                val progress = if (updateTotalBytes > 0L) {
+                                    (updateDownloadedBytes.toFloat() / updateTotalBytes)
+                                        .coerceIn(0f, 1f)
+                                } else {
+                                    0f
                                 }
+                                LinearProgressIndicator(
+                                    progress = { progress },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Text(
+                                    if (updateTotalBytes > 0L) {
+                                        val downloadedMb = updateDownloadedBytes / 1_048_576f
+                                        val totalMb = updateTotalBytes / 1_048_576f
+                                        "Загружено %.1f из %.1f МБ · %d%%".format(
+                                            downloadedMb,
+                                            totalMb,
+                                            (progress * 100).toInt()
+                                        )
+                                    } else {
+                                        "Подключение к GitHub…"
+                                    }
+                                )
                             }
                         }
                     },
@@ -356,7 +381,7 @@ private fun SenkuroFarmApp() {
                             enabled = !downloadingUpdate,
                             onClick = {
                                 if (AppUpdater.canInstallPackages(context)) {
-                                    downloadRequest = release
+                                    startUpdateDownload(release)
                                 } else {
                                     pendingInstallPermission = release
                                     unknownSourcesLauncher.launch(

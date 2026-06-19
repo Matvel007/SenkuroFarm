@@ -59,7 +59,11 @@ internal object AppUpdater {
         }
     }
 
-    suspend fun downloadAndVerify(context: Context, release: GithubRelease): File =
+    suspend fun downloadAndVerify(
+        context: Context,
+        release: GithubRelease,
+        onProgress: suspend (downloaded: Long, total: Long) -> Unit
+    ): File =
         withContext(Dispatchers.IO) {
             val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
             val target = File(updatesDir, "SenkuroFarm-${release.version}.apk")
@@ -71,8 +75,29 @@ internal object AppUpdater {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) error("Не удалось скачать APK: ${response.code}")
                 val body = response.body ?: error("GitHub вернул пустой файл")
+                val total = body.contentLength()
                 temporary.outputStream().use { output ->
-                    body.byteStream().use { input -> input.copyTo(output) }
+                    body.byteStream().use { input ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        var downloaded = 0L
+                        var lastProgressUpdate = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            downloaded += read
+                            val now = System.currentTimeMillis()
+                            if (now - lastProgressUpdate >= 150 || downloaded == total) {
+                                withContext(Dispatchers.Main) {
+                                    onProgress(downloaded, total)
+                                }
+                                lastProgressUpdate = now
+                            }
+                        }
+                        withContext(Dispatchers.Main) {
+                            onProgress(downloaded, total)
+                        }
+                    }
                 }
             }
             if (temporary.length() < 1_000_000L) {
