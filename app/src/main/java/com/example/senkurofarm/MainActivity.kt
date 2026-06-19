@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -64,6 +65,7 @@ import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.QueryStats
 import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -71,6 +73,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -201,32 +204,59 @@ private val lightScheme = lightColorScheme(
 @Composable
 private fun SenkuroFarmApp() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var darkTheme by remember { mutableStateOf(true) }
     var authorized by remember { mutableStateOf(hasSenkuroSession(context)) }
     var showLicense by remember { mutableStateOf(false) }
     var showSenkuroWeb by remember { mutableStateOf(false) }
     var savedProfileUrl by remember { mutableStateOf(loadSavedProfileUrl(context)) }
     var shellReloadKey by remember { mutableIntStateOf(0) }
+    var availableUpdate by remember { mutableStateOf<GithubRelease?>(null) }
+    var pendingInstallPermission by remember { mutableStateOf<GithubRelease?>(null) }
+    var downloadRequest by remember { mutableStateOf<GithubRelease?>(null) }
+    var checkingUpdate by remember { mutableStateOf(false) }
+    var downloadingUpdate by remember { mutableStateOf(false) }
+    var updateNotice by remember { mutableStateOf<String?>(null) }
+
+    val unknownSourcesLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val release = pendingInstallPermission
+        pendingInstallPermission = null
+        if (release != null && AppUpdater.canInstallPackages(context)) {
+            downloadRequest = release
+        } else if (release != null) {
+            updateNotice = "Без разрешения на установку приложений обновление невозможно."
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        runCatching { AppUpdater.findUpdate(context) }
+            .onSuccess { release ->
+                if (release != null) availableUpdate = release
+            }
+    }
+
+    LaunchedEffect(downloadRequest) {
+        val release = downloadRequest ?: return@LaunchedEffect
+        downloadRequest = null
+        downloadingUpdate = true
+        runCatching { AppUpdater.downloadAndVerify(context, release) }
+            .onSuccess { apk ->
+                availableUpdate = null
+                AppUpdater.install(context, apk)
+            }
+            .onFailure {
+                updateNotice = "Не удалось установить обновление: ${it.message.orEmpty()}"
+            }
+        downloadingUpdate = false
+    }
 
     MaterialTheme(colorScheme = if (darkTheme) darkScheme else lightScheme) {
-        Surface(modifier = Modifier.fillMaxSize()) {
-            when {
-                !authorized -> LoginScreen(onLoggedIn = { profileUrl ->
-                    saveSenkuroCookies(context)
-                    saveAuthorized(context, true)
-                    if (profileUrl.isNotBlank()) {
-                        val normalizedProfile = normalizeProfileUrl(profileUrl)
-                        savedProfileUrl = normalizedProfile
-                        saveProfileUrl(context, normalizedProfile)
-                    }
-                    authorized = true
-                    shellReloadKey += 1
-                })
-                showSenkuroWeb -> LoginScreen(
-                    startInWeb = true,
-                    title = "Senkuro",
-                    doneText = "Назад в приложение",
-                    onLoggedIn = { profileUrl ->
+        Box(modifier = Modifier.fillMaxSize()) {
+            Surface(modifier = Modifier.fillMaxSize()) {
+                when {
+                    !authorized -> LoginScreen(onLoggedIn = { profileUrl ->
                         saveSenkuroCookies(context)
                         saveAuthorized(context, true)
                         if (profileUrl.isNotBlank()) {
@@ -235,23 +265,128 @@ private fun SenkuroFarmApp() {
                             saveProfileUrl(context, normalizedProfile)
                         }
                         authorized = true
-                        showSenkuroWeb = false
                         shellReloadKey += 1
+                    })
+                    showSenkuroWeb -> LoginScreen(
+                        startInWeb = true,
+                        title = "Senkuro",
+                        doneText = "Назад в приложение",
+                        onLoggedIn = { profileUrl ->
+                            saveSenkuroCookies(context)
+                            saveAuthorized(context, true)
+                            if (profileUrl.isNotBlank()) {
+                                val normalizedProfile = normalizeProfileUrl(profileUrl)
+                                savedProfileUrl = normalizedProfile
+                                saveProfileUrl(context, normalizedProfile)
+                            }
+                            authorized = true
+                            showSenkuroWeb = false
+                            shellReloadKey += 1
+                        }
+                    )
+                    showLicense -> LicenseScreen(onBack = { showLicense = false })
+                    else -> MainShell(
+                        initialProfileUrl = savedProfileUrl,
+                        externalReloadKey = shellReloadKey,
+                        darkTheme = darkTheme,
+                        onDarkThemeChange = { darkTheme = it },
+                        onProfileUrlSaved = {
+                            val normalizedProfile = normalizeProfileUrl(it)
+                            savedProfileUrl = normalizedProfile
+                            saveProfileUrl(context, normalizedProfile)
+                        },
+                        onOpenSession = { showSenkuroWeb = true },
+                        onOpenLicense = { showLicense = true },
+                        currentVersion = AppUpdater.currentVersion(context),
+                        checkingUpdate = checkingUpdate,
+                        onCheckUpdate = {
+                            if (!checkingUpdate) {
+                                scope.launch {
+                                    checkingUpdate = true
+                                    runCatching { AppUpdater.findUpdate(context) }
+                                        .onSuccess { release ->
+                                            if (release == null) {
+                                                updateNotice =
+                                                    "Установлена актуальная версия ${AppUpdater.currentVersion(context)}."
+                                            } else {
+                                                availableUpdate = release
+                                            }
+                                        }
+                                        .onFailure {
+                                            updateNotice =
+                                                "Не удалось проверить обновления: ${it.message.orEmpty()}"
+                                        }
+                                    checkingUpdate = false
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+
+            availableUpdate?.let { release ->
+                AlertDialog(
+                    onDismissRequest = {
+                        if (!downloadingUpdate) availableUpdate = null
+                    },
+                    title = { Text("Доступно обновление ${release.version}") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(release.title, fontWeight = FontWeight.Bold)
+                            Text(
+                                release.notes,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 360.dp)
+                                    .verticalScroll(rememberScrollState())
+                            )
+                            if (downloadingUpdate) {
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    CircularProgressIndicator(modifier = Modifier.size(22.dp))
+                                    Text("Загрузка и проверка APK…")
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                            enabled = !downloadingUpdate,
+                            onClick = {
+                                if (AppUpdater.canInstallPackages(context)) {
+                                    downloadRequest = release
+                                } else {
+                                    pendingInstallPermission = release
+                                    unknownSourcesLauncher.launch(
+                                        AppUpdater.unknownSourcesIntent(context)
+                                    )
+                                }
+                            }
+                        ) {
+                            Icon(Icons.Rounded.SystemUpdate, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Обновить")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            enabled = !downloadingUpdate,
+                            onClick = { availableUpdate = null }
+                        ) { Text("Позже") }
                     }
                 )
-                showLicense -> LicenseScreen(onBack = { showLicense = false })
-                else -> MainShell(
-                    initialProfileUrl = savedProfileUrl,
-                    externalReloadKey = shellReloadKey,
-                    darkTheme = darkTheme,
-                    onDarkThemeChange = { darkTheme = it },
-                    onProfileUrlSaved = {
-                        val normalizedProfile = normalizeProfileUrl(it)
-                        savedProfileUrl = normalizedProfile
-                        saveProfileUrl(context, normalizedProfile)
-                    },
-                    onOpenSession = { showSenkuroWeb = true },
-                    onOpenLicense = { showLicense = true }
+            }
+
+            updateNotice?.let { message ->
+                AlertDialog(
+                    onDismissRequest = { updateNotice = null },
+                    title = { Text("Обновления") },
+                    text = { Text(message) },
+                    confirmButton = {
+                        TextButton(onClick = { updateNotice = null }) { Text("Хорошо") }
+                    }
                 )
             }
         }
@@ -647,7 +782,10 @@ private fun MainShell(
     onDarkThemeChange: (Boolean) -> Unit,
     onProfileUrlSaved: (String) -> Unit,
     onOpenSession: () -> Unit,
-    onOpenLicense: () -> Unit
+    onOpenLicense: () -> Unit,
+    currentVersion: String,
+    checkingUpdate: Boolean,
+    onCheckUpdate: () -> Unit
 ) {
     val context = LocalContext.current
     var selectedTab by remember { mutableStateOf(Tab.Home) }
@@ -860,7 +998,13 @@ private fun MainShell(
                     modifier = Modifier.zIndex(2f)
                 )
                 Tab.Settings -> SettingsScreen(darkTheme = darkTheme, onDarkThemeChange = onDarkThemeChange, modifier = Modifier.zIndex(2f))
-                Tab.Info -> InfoScreen(onOpenLicense = onOpenLicense, modifier = Modifier.zIndex(2f))
+                Tab.Info -> InfoScreen(
+                    onOpenLicense = onOpenLicense,
+                    currentVersion = currentVersion,
+                    checkingUpdate = checkingUpdate,
+                    onCheckUpdate = onCheckUpdate,
+                    modifier = Modifier.zIndex(2f)
+                )
             }
         }
     }
@@ -1516,19 +1660,44 @@ private fun SettingsScreen(darkTheme: Boolean, onDarkThemeChange: (Boolean) -> U
 }
 
 @Composable
-private fun InfoScreen(onOpenLicense: () -> Unit, modifier: Modifier = Modifier) {
+private fun InfoScreen(
+    onOpenLicense: () -> Unit,
+    currentVersion: String,
+    checkingUpdate: Boolean,
+    onCheckUpdate: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     val context = LocalContext.current
     LazyColumn(modifier = modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("Информация", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Black) }
         item {
             SectionCard("Senkuro Farm") {
-                Text("Версия: 1.0.0")
+                Text("Версия: $currentVersion")
                 Text("Статус: Open Source")
                 Text("Лицензия: MIT")
                 Spacer(Modifier.height(10.dp))
                 Text(
                     "Приложение создано для безопасного использования. Программа не является официальным продуктом Senkuro и не аффилирована с ним. Все права на торговые марки и контент Senkuro принадлежат их законным владельцам. Приложение использует открытый веб-интерфейс сайта. Пароль пользователя не сохраняется и не передается третьим лицам. Приложение создано с помощью GPT-5.5."
                 )
+            }
+        }
+        item {
+            SectionCard("Обновления") {
+                Text("Новые версии загружаются из официального GitHub-репозитория проекта.")
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = onCheckUpdate,
+                    enabled = !checkingUpdate,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (checkingUpdate) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                    } else {
+                        Icon(Icons.Rounded.SystemUpdate, contentDescription = null)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (checkingUpdate) "Проверка…" else "Проверить обновления")
+                }
             }
         }
         item {

@@ -8,7 +8,7 @@
 
 [![Android](https://img.shields.io/badge/Android-7.0%2B-3DDC84?logo=android&logoColor=white)](https://www.android.com/)
 [![Kotlin](https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
-[![Version](https://img.shields.io/badge/version-1.0.0-9B7BFF)](https://github.com/Matvel007)
+[![Version](https://img.shields.io/badge/version-1.1.0-9B7BFF)](https://github.com/Matvel007/SenkuroFarm/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#-лицензия)
 
 </div>
@@ -37,6 +37,7 @@
 - 🔔 Постоянное уведомление с состоянием фарма и кнопкой остановки.
 - 🎨 Тёмное минималистичное оформление на Jetpack Compose.
 - 🔐 Авторизация через WebView — пароль приложением не сохраняется.
+- 🔄 Автоматическая проверка обновлений через GitHub Releases.
 
 ## 🚀 Установка
 
