@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings as AndroidSettings
 import android.util.Base64
 import android.view.View
@@ -210,6 +211,7 @@ internal class FarmWebBridge(
 private const val CARDS_PAGE_SIZE = 20
 private const val GRAPHQL_URL = "https://api.senkuro.me/graphql"
 private const val CARDS_CACHE_TTL_MS = 10 * 60 * 1000L
+private const val VISIBLE_FARM_SYNC_INTERVAL_MS = 3_000L
 private val networkClient = OkHttpClient()
 private val graphQlUserIdCache = ConcurrentHashMap<String, String>()
 
@@ -1459,6 +1461,9 @@ private fun FarmSiteWebView(
 ) {
     val appContext = LocalContext.current.applicationContext
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val lastVisibleSyncAt = remember { longArrayOf(0L) }
+    val lastAppliedDelay = remember { intArrayOf(-1) }
+    val lastFarmingState = remember { arrayOfNulls<Boolean>(1) }
     val bridge = remember(onUrlChanged, appContext) {
         FarmWebBridge(
             mainHandler = mainHandler,
@@ -1509,16 +1514,17 @@ private fun FarmSiteWebView(
             onWebViewReady(webView)
             webView.visibility = if (isVisible) View.VISIBLE else View.INVISIBLE
             if (isVisible) webView.onResume() else webView.onPause()
-            webView.evaluateJavascript(farmReaderScript(false, delaySeconds), null)
-            webView.evaluateJavascript(
-                if (isFarming) existingCardCollectorScript()
-                else "window.__senkuroVisibleCollectorDispose && window.__senkuroVisibleCollectorDispose();",
-                null
-            )
-            webView.evaluateJavascript("location.href") { rawUrl ->
-                cleanJsString(rawUrl)
-                    .takeIf { it.startsWith("https://senkuro.me/") }
-                    ?.let(onUrlChanged)
+            if (lastAppliedDelay[0] != delaySeconds) {
+                lastAppliedDelay[0] = delaySeconds
+                webView.evaluateJavascript(farmReaderScript(false, delaySeconds), null)
+            }
+            if (lastFarmingState[0] != isFarming) {
+                lastFarmingState[0] = isFarming
+                webView.evaluateJavascript(
+                    if (isFarming) existingCardCollectorScript()
+                    else "window.__senkuroVisibleCollectorDispose && window.__senkuroVisibleCollectorDispose();",
+                    null
+                )
             }
             val backgroundUrl = farmProgress.url.takeIf {
                 it.startsWith("https://senkuro.me/") && "/chapters/" in it
@@ -1529,7 +1535,11 @@ private fun FarmSiteWebView(
             ) {
                 webView.loadUrl(backgroundUrl)
             } else if (isFarming && isVisible && farmProgress.max > 0) {
-                webView.evaluateJavascript(syncFarmProgressScript(farmProgress), null)
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastVisibleSyncAt[0] >= VISIBLE_FARM_SYNC_INTERVAL_MS) {
+                    lastVisibleSyncAt[0] = now
+                    webView.evaluateJavascript(syncFarmProgressScript(farmProgress), null)
+                }
             }
         }
     )
@@ -1644,7 +1654,10 @@ private fun syncFarmProgressScript(progress: FarmProgress): String {
         (function() {
           const root = document.scrollingElement || document.documentElement;
           const max = Math.max(0, root.scrollHeight - window.innerHeight);
-          window.scrollTo(0, Math.floor(max * $ratio));
+          window.scrollTo({
+            top: Math.floor(max * $ratio),
+            behavior: 'smooth'
+          });
         })();
     """.trimIndent()
 }

@@ -173,7 +173,8 @@ class FarmService : Service() {
                     settings.domStorageEnabled = true
                     settings.databaseEnabled = true
                     settings.loadsImagesAutomatically = true
-                    settings.mediaPlaybackRequiresUserGesture = false
+                    settings.mediaPlaybackRequiresUserGesture = true
+                    keepScreenOn = false
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
                     }
@@ -182,6 +183,8 @@ class FarmService : Service() {
                     webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView, url: String) {
                             super.onPageFinished(view, url)
+                            view.keepScreenOn = false
+                            overlayContainer?.keepScreenOn = false
                             failedTicks = 0
                             saveRunning(true, "Фарм работает: страница загружена")
                             view.evaluateJavascript(backgroundCardCollectorScript(), null)
@@ -240,12 +243,12 @@ class FarmService : Service() {
             return null
         }
         val container = FrameLayout(this).apply {
-            alpha = 0.01f
             visibility = View.VISIBLE
+            keepScreenOn = false
             setBackgroundColor(android.graphics.Color.TRANSPARENT)
         }
-        farmViewportWidth = resources.displayMetrics.widthPixels.coerceAtMost(720)
-        farmViewportHeight = resources.displayMetrics.heightPixels.coerceAtMost(1280)
+        farmViewportWidth = resources.displayMetrics.widthPixels.coerceAtMost(360)
+        farmViewportHeight = resources.displayMetrics.heightPixels.coerceAtMost(640)
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -253,16 +256,16 @@ class FarmService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
         val params = WindowManager.LayoutParams(
-            farmViewportWidth,
-            farmViewportHeight,
+            OVERLAY_WINDOW_SIZE_PX,
+            OVERLAY_WINDOW_SIZE_PX,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.START or Gravity.TOP
+            alpha = 0.01f
         }
         runCatching {
             getSystemService(WindowManager::class.java).addView(container, params)
@@ -324,7 +327,9 @@ class FarmService : Service() {
 
     private fun scrollWebViewsNow() {
         if (webViews.isEmpty()) return
+        overlayContainer?.keepScreenOn = false
         webViews.toList().forEachIndexed { index, webView ->
+            webView.keepScreenOn = false
             webView.onResume()
             webView.resumeTimers()
             webView.evaluateJavascript(scrollStepScript()) { rawResult ->
@@ -467,7 +472,10 @@ class FarmService : Service() {
         saveRunning(true, message)
         mainHandler.post {
             destroyWebViewsNow()
-            startWebViews()
+            mainHandler.postDelayed(
+                { startWebViews() },
+                WEBVIEW_RECREATE_DELAY_MS
+            )
         }
     }
 
@@ -891,6 +899,8 @@ class FarmService : Service() {
         private const val LOG_TAG = "SenkuroFarm"
         private const val WEBVIEW_RECYCLE_CHAPTERS = 10
         private const val WEBVIEW_RECYCLE_INTERVAL_MS = 10 * 60_000L
+        private const val WEBVIEW_RECREATE_DELAY_MS = 750L
+        private const val OVERLAY_WINDOW_SIZE_PX = 1
         private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60_000L
         private const val CARD_DEDUPE_WINDOW_MS = 15_000L
 
