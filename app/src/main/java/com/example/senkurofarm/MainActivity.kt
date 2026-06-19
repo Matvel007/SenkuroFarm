@@ -186,12 +186,23 @@ private data class CachedCardsPage(val page: CardsPage, val savedAt: Long)
 @Keep
 internal class FarmWebBridge(
     private val mainHandler: Handler,
-    private val onUrlChanged: (String) -> Unit
+    private val onUrlChanged: (String) -> Unit,
+    private val onCardCollected: (String, String) -> Unit
 ) {
     @JavascriptInterface
     fun onUrlChanged(url: String?) {
         url?.takeIf { it.isNotBlank() }?.let { value ->
             mainHandler.post { onUrlChanged(value) }
+        }
+    }
+
+    @JavascriptInterface
+    fun onCardCollected(name: String?, rank: String?) {
+        mainHandler.post {
+            onCardCollected(
+                name.orEmpty().ifBlank { "Карточка" },
+                rank.orEmpty().uppercase().ifBlank { "?" }
+            )
         }
     }
 }
@@ -517,6 +528,15 @@ private fun startFarmService(context: Context, mangaUrl: String, threads: Int, d
 private fun stopFarmService(context: Context) {
     val intent = Intent(context, FarmService::class.java).setAction(FarmService.ACTION_STOP)
     context.startService(intent)
+}
+
+private fun recordVisibleCard(context: Context, name: String, rank: String) {
+    context.startService(
+        Intent(context, FarmService::class.java)
+            .setAction(FarmService.ACTION_RECORD_CARD)
+            .putExtra(FarmService.EXTRA_CARD_NAME, name)
+            .putExtra(FarmService.EXTRA_CARD_RANK, rank)
+    )
 }
 
 private fun isFarmServiceRunning(context: Context): Boolean =
@@ -946,7 +966,7 @@ private fun MainShell(
             }
             farmProgress = loadFarmProgress(context)
             farmStatistics = loadFarmStatistics(context)
-            delay(1_000)
+            kotlinx.coroutines.delay(1_000)
         }
     }
 
@@ -1311,8 +1331,21 @@ private fun FarmScreen(
     modifier: Modifier = Modifier
 ) {
     var currentUrl by remember { mutableStateOf("https://senkuro.me/") }
+    var farmWebView by remember { mutableStateOf<WebView?>(null) }
     var delay by remember { mutableFloatStateOf(3f) }
     var controlsExpanded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isVisible, farmWebView) {
+        val webView = farmWebView ?: return@LaunchedEffect
+        while (isVisible) {
+            webView.evaluateJavascript("location.href") { rawUrl ->
+                cleanJsString(rawUrl)
+                    .takeIf { it.startsWith("https://senkuro.me/") }
+                    ?.let { currentUrl = it }
+            }
+            delay(1_000)
+        }
+    }
 
     Box(modifier = modifier.fillMaxSize()) {
         FarmSiteWebView(
@@ -1321,6 +1354,7 @@ private fun FarmScreen(
             delaySeconds = delay.toInt(),
             farmProgress = farmProgress,
             onUrlChanged = { currentUrl = it },
+            onWebViewReady = { farmWebView = it },
             modifier = Modifier.fillMaxSize()
         )
 
@@ -1353,7 +1387,20 @@ private fun FarmScreen(
                     }
                     Slider(value = delay, onValueChange = { delay = it }, valueRange = 1f..15f, steps = 13)
                     Button(
-                        onClick = { onFarmingChange(!isFarming, currentUrl, 1, delay.toInt()) },
+                        onClick = {
+                            if (isFarming) {
+                                onFarmingChange(false, currentUrl, 1, delay.toInt())
+                            } else {
+                                farmWebView?.evaluateJavascript("location.href") { rawUrl ->
+                                    val actualUrl = cleanJsString(rawUrl)
+                                    currentUrl = actualUrl
+                                    if (isReaderPageUrl(actualUrl)) {
+                                        onFarmingChange(true, actualUrl, 1, delay.toInt())
+                                    }
+                                }
+                            }
+                        },
+                        enabled = isFarming || farmWebView != null,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (isFarming) Color(0xFFE5484D) else Color(0xFF2FB344)
                         ),
@@ -1364,6 +1411,13 @@ private fun FarmScreen(
                         Text(if (isFarming) "Стоп" else "Старт")
                     }
                     Text("URL: $currentUrl", style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (!isFarming && !isReaderPageUrl(currentUrl)) {
+                        Text(
+                            "Откройте конкретную главу перед запуском.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
                     if (farmMessage.isNotBlank()) {
                         Text(farmMessage, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     }
@@ -1400,11 +1454,20 @@ private fun FarmSiteWebView(
     delaySeconds: Int,
     farmProgress: FarmProgress,
     onUrlChanged: (String) -> Unit,
+    onWebViewReady: (WebView) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val appContext = LocalContext.current.applicationContext
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
-    val bridge = remember(onUrlChanged) { FarmWebBridge(mainHandler, onUrlChanged) }
+    val bridge = remember(onUrlChanged, appContext) {
+        FarmWebBridge(
+            mainHandler = mainHandler,
+            onUrlChanged = onUrlChanged,
+            onCardCollected = { name, rank ->
+                recordVisibleCard(appContext, name, rank)
+            }
+        )
+    }
     AndroidView(
         modifier = modifier
             .fillMaxWidth()
@@ -1429,6 +1492,9 @@ private fun FarmSiteWebView(
                         saveSenkuroCookies(appContext)
                         onUrlChanged(url)
                         view.evaluateJavascript(farmReaderScript(false, delaySeconds), null)
+                        if (isFarming) {
+                            view.evaluateJavascript(existingCardCollectorScript(), null)
+                        }
                     }
                 }
                 loadUrl(
@@ -1436,11 +1502,19 @@ private fun FarmSiteWebView(
                         .takeIf { it.startsWith("https://senkuro.me/") }
                         ?: "https://senkuro.me/"
                 )
+                post { onWebViewReady(this) }
             }
         },
         update = { webView ->
+            onWebViewReady(webView)
             webView.visibility = if (isVisible) View.VISIBLE else View.INVISIBLE
+            if (isVisible) webView.onResume() else webView.onPause()
             webView.evaluateJavascript(farmReaderScript(false, delaySeconds), null)
+            webView.evaluateJavascript(
+                if (isFarming) existingCardCollectorScript()
+                else "window.__senkuroVisibleCollectorDispose && window.__senkuroVisibleCollectorDispose();",
+                null
+            )
             webView.evaluateJavascript("location.href") { rawUrl ->
                 cleanJsString(rawUrl)
                     .takeIf { it.startsWith("https://senkuro.me/") }
@@ -1463,6 +1537,105 @@ private fun FarmSiteWebView(
 
 private fun normalizeReaderLocation(url: String): String =
     url.substringBefore('?').substringBefore('#')
+
+private fun isReaderPageUrl(url: String): Boolean =
+    url.startsWith("https://senkuro.me/") &&
+        Regex("/chapters/[^/]+/pages/\\d+").containsMatchIn(url)
+
+internal fun existingCardCollectorScript(): String = """
+    (function() {
+      window.__senkuroVisibleCollectorDispose && window.__senkuroVisibleCollectorDispose();
+      let reported = false;
+      let state = 'idle';
+      const visible = element => {
+        if (!element || !element.isConnected) return false;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return rect.width > 3 && rect.height > 3 &&
+          style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const findDrop = () => [
+        ...document.querySelectorAll(
+          'img.cards-drop, .cards-drop, [class*="cards-drop"], ' +
+          '[class*="CardDrop"]:not([class*="Modal"]), [data-card-drop]'
+        )
+      ].find(element => visible(element) && !element.closest(
+        '.modal-container-drop, [class*="CardDropModal"], [role="dialog"]'
+      ));
+      const findModal = () => {
+        const direct = document.querySelector(
+          '.modal-container-drop, [class*="CardDropModal"], [class*="card-drop-modal"]'
+        );
+        if (direct) return direct;
+        return [...document.querySelectorAll('[role="dialog"]')]
+          .find(dialog => dialog.querySelector('.collectible-card'));
+      };
+      const dispatchClick = element => {
+        const target = element?.closest('button, a, [role="button"]') || element;
+        if (!target) return;
+        const rect = target.getBoundingClientRect();
+        const x = Math.floor(rect.left + rect.width / 2);
+        const y = Math.floor(rect.top + rect.height / 2);
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          target.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, clientX: x, clientY: y
+          }));
+        }
+      };
+      const check = () => {
+        const modal = findModal();
+        if (modal) {
+          const cardName =
+            modal.querySelector('.collectible-card__front img')?.getAttribute('alt') ||
+            modal.querySelector('.collectible-card img')?.getAttribute('alt') ||
+            modal.querySelector('img[alt]')?.getAttribute('alt') ||
+            'Карточка';
+          const cardLink = modal.querySelector('a.collectible-card')?.getAttribute('href') || '';
+          const rankMatch = cardLink.match(/-((?:sr)|[sabcdef])$/i);
+          const cardRank =
+            modal.querySelector('[data-rank]')?.getAttribute('data-rank') ||
+            rankMatch?.[1]?.toUpperCase() ||
+            '?';
+          const x = Math.floor(window.innerWidth / 2);
+          const y = Math.max(1, window.innerHeight - 12);
+          dispatchClick(document.elementFromPoint(x, y) || modal);
+          if (!reported && window.SenkuroFarm?.onCardCollected) {
+            reported = true;
+            window.SenkuroFarm.onCardCollected(cardName, cardRank);
+          }
+          state = 'closing';
+          return;
+        }
+        if (state === 'closing') {
+          state = 'idle';
+          reported = false;
+        }
+        const drop = findDrop();
+        if (drop && state !== 'opening') {
+          state = 'opening';
+          dispatchClick(drop);
+        } else if (!drop && state === 'opening') {
+          state = 'idle';
+        }
+      };
+      let queued = false;
+      const observer = new MutationObserver(function() {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(function() {
+          queued = false;
+          check();
+        });
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      const timer = setInterval(check, 350);
+      window.__senkuroVisibleCollectorDispose = function() {
+        observer.disconnect();
+        clearInterval(timer);
+      };
+      check();
+    })();
+""".trimIndent()
 
 private fun syncFarmProgressScript(progress: FarmProgress): String {
     val ratio = (progress.position.toDouble() / progress.max.coerceAtLeast(1).toDouble())

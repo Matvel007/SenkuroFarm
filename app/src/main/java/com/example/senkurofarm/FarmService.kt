@@ -22,6 +22,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -43,6 +44,8 @@ class FarmService : Service() {
     private var farmJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var overlayContainer: FrameLayout? = null
+    private var farmViewportWidth = 0
+    private var farmViewportHeight = 0
     private var recreatingWebViews = false
     private var sessionTimeCommitted = false
     private var startedAt = 0L
@@ -54,6 +57,7 @@ class FarmService : Service() {
     private var lastKnownUrl = ""
     private var lastChapterId = ""
     private var chapterTransitions = 0
+    private var webViewCreatedAt = 0L
     private var mangaTitle = "Манга"
     private var mangaUrl = "https://senkuro.me/"
     private var threads = 1
@@ -68,6 +72,14 @@ class FarmService : Service() {
         if (intent?.action == ACTION_STOP) {
             stopFarm("Фарм остановлен из уведомления")
             return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_RECORD_CARD) {
+            val farmIsActive = farmJob?.isActive == true
+            val name = intent.getStringExtra(EXTRA_CARD_NAME).orEmpty().ifBlank { "Карточка" }
+            val rank = intent.getStringExtra(EXTRA_CARD_RANK).orEmpty().uppercase().ifBlank { "?" }
+            recordCollectedCard(name, rank)
+            if (!farmIsActive) stopSelf()
+            return if (farmIsActive) START_STICKY else START_NOT_STICKY
         }
 
         restoreOrUpdateConfiguration(intent)
@@ -98,6 +110,11 @@ class FarmService : Service() {
 
     private fun startFarm() {
         if (farmJob?.isActive == true) return
+        if (!isReaderPageUrl(mangaUrl)) {
+            saveRunning(false, "Откройте конкретную главу перед запуском")
+            stopSelf()
+            return
+        }
         startedAt = System.currentTimeMillis()
         sessionTimeCommitted = false
         completedTicks = 0
@@ -149,6 +166,7 @@ class FarmService : Service() {
                 return@post
             }
             CookieManager.getInstance().setAcceptCookie(true)
+            webViewCreatedAt = SystemClock.elapsedRealtime()
             repeat(threads) { index ->
                 val webView = WebView(applicationContext).apply {
                     settings.javaScriptEnabled = true
@@ -160,12 +178,16 @@ class FarmService : Service() {
                         setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
                     }
                     CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                    addJavascriptInterface(FarmJavascriptBridge(), "SenkuroFarmNative")
                     webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView, url: String) {
                             super.onPageFinished(view, url)
                             failedTicks = 0
                             saveRunning(true, "Фарм работает: страница загружена")
-                            view.evaluateJavascript(cardWatcherScript(), null)
+                            view.evaluateJavascript(backgroundCardCollectorScript(), null)
+                            view.evaluateJavascript(scrollStepScript()) { rawResult ->
+                                handleScrollResult(index, rawResult)
+                            }
                             Log.d(LOG_TAG, "webView[$index] loaded $url")
                         }
 
@@ -183,26 +205,26 @@ class FarmService : Service() {
                     resumeTimers()
                     measure(
                         View.MeasureSpec.makeMeasureSpec(
-                            resources.displayMetrics.widthPixels,
+                            farmViewportWidth,
                             View.MeasureSpec.EXACTLY
                         ),
                         View.MeasureSpec.makeMeasureSpec(
-                            resources.displayMetrics.heightPixels,
+                            farmViewportHeight,
                             View.MeasureSpec.EXACTLY
                         )
                     )
                     layout(
                         0,
                         0,
-                        resources.displayMetrics.widthPixels,
-                        resources.displayMetrics.heightPixels
+                        farmViewportWidth,
+                        farmViewportHeight
                     )
                 }
                 container.addView(
                     webView,
                     FrameLayout.LayoutParams(
-                        resources.displayMetrics.widthPixels,
-                        resources.displayMetrics.heightPixels
+                        farmViewportWidth,
+                        farmViewportHeight
                     )
                 )
                 webViews.add(webView)
@@ -222,6 +244,8 @@ class FarmService : Service() {
             visibility = View.VISIBLE
             setBackgroundColor(android.graphics.Color.TRANSPARENT)
         }
+        farmViewportWidth = resources.displayMetrics.widthPixels.coerceAtMost(720)
+        farmViewportHeight = resources.displayMetrics.heightPixels.coerceAtMost(1280)
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -229,8 +253,8 @@ class FarmService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
         val params = WindowManager.LayoutParams(
-            resources.displayMetrics.widthPixels,
-            resources.displayMetrics.heightPixels,
+            farmViewportWidth,
+            farmViewportHeight,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -259,7 +283,15 @@ class FarmService : Service() {
 
     private fun destroyWebViewsNow() {
         webViews.toList().forEach { webView ->
+            webView.evaluateJavascript(
+                "window.__senkuroFarmDispose && window.__senkuroFarmDispose();",
+                null
+            )
+            webView.removeJavascriptInterface("SenkuroFarmNative")
+            webView.onPause()
             webView.stopLoading()
+            webView.loadUrl("about:blank")
+            webView.clearHistory()
             (webView.parent as? FrameLayout)?.removeView(webView)
             webView.removeAllViews()
             webView.destroy()
@@ -333,10 +365,7 @@ class FarmService : Service() {
                 "card-collected" -> {
                     val cardName = result.optString("cardName").ifBlank { "Карточка" }
                     val cardRank = result.optString("cardRank").uppercase().ifBlank { "?" }
-                    val totalCards = incrementCards(cardRank)
-                    saveRunning(true, "Собрана: $cardName · всего: $totalCards")
-                    updateNotification("карточка собрана")
-                    Log.d(LOG_TAG, "card collected name=$cardName rank=$cardRank total=$totalCards")
+                    recordCollectedCard(cardName, cardRank)
                 }
             }
             saveProgress(position, max, currentUrl)
@@ -367,6 +396,35 @@ class FarmService : Service() {
         }
         editor.apply()
         return total
+    }
+
+    private fun recordCollectedCard(name: String, rank: String) {
+        val preferences = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val fingerprint = "${name.trim().lowercase()}|${rank.trim().uppercase()}"
+        val now = System.currentTimeMillis()
+        val duplicate = preferences.getString(KEY_LAST_CARD_FINGERPRINT, "") == fingerprint &&
+            now - preferences.getLong(KEY_LAST_CARD_RECORDED_AT, 0L) < CARD_DEDUPE_WINDOW_MS
+        if (duplicate) return
+        preferences.edit()
+            .putString(KEY_LAST_CARD_FINGERPRINT, fingerprint)
+            .putLong(KEY_LAST_CARD_RECORDED_AT, now)
+            .apply()
+        val totalCards = incrementCards(rank)
+        saveRunning(true, "Собрана: $name · всего: $totalCards")
+        updateNotification("карточка собрана")
+        Log.d(LOG_TAG, "card collected name=$name rank=$rank total=$totalCards")
+    }
+
+    private inner class FarmJavascriptBridge {
+        @JavascriptInterface
+        fun onCardCollected(name: String?, rank: String?) {
+            mainHandler.post {
+                recordCollectedCard(
+                    name.orEmpty().ifBlank { "Карточка" },
+                    rank.orEmpty().uppercase().ifBlank { "?" }
+                )
+            }
+        }
     }
 
     private fun saveProgress(position: Long, max: Long, url: String) {
@@ -417,6 +475,10 @@ class FarmService : Service() {
         if (farmJob?.isActive != true || recreatingWebViews) return
         if (wakeLock?.isHeld != true) acquireWakeLock()
         val now = SystemClock.elapsedRealtime()
+        if (now - webViewCreatedAt >= WEBVIEW_RECYCLE_INTERVAL_MS) {
+            scheduleWebViewRecovery("Профилактическая очистка WebView")
+            return
+        }
         val callbackTimeout = maxOf(90_000L, pageDelaySeconds * 15_000L)
         val progressTimeout = maxOf(4 * 60_000L, pageDelaySeconds * 60_000L)
         when {
@@ -431,12 +493,16 @@ class FarmService : Service() {
         val saved = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_CURRENT_URL, "")
             .orEmpty()
-        return saved.takeIf { it.startsWith("https://senkuro.me/") && "/chapters/" in it }
+        return saved.takeIf(::isReaderPageUrl)
             ?: mangaUrl
     }
 
     private fun chapterId(url: String): String =
         Regex("/chapters/([^/]+)").find(url)?.groupValues?.getOrNull(1).orEmpty()
+
+    private fun isReaderPageUrl(url: String): Boolean =
+        url.startsWith("https://senkuro.me/") &&
+            Regex("/chapters/[^/]+/pages/\\d+").containsMatchIn(url)
 
     private fun scrollStepScript(): String = """
         (function() {
@@ -444,6 +510,16 @@ class FarmService : Service() {
             const root = document.scrollingElement || document.documentElement;
             if (!root) {
               return { ok: false, error: 'document-not-ready', url: location.href };
+            }
+            if (window.__senkuroFarmCardBusy) {
+              return {
+                ok: true,
+                position: window.scrollY,
+                max: Math.max(0, root.scrollHeight - window.innerHeight),
+                hidden: document.hidden,
+                url: location.href,
+                action: 'card-busy'
+              };
             }
             const modal = document.querySelector('.modal-container-drop');
             if (modal) {
@@ -527,20 +603,25 @@ class FarmService : Service() {
             if (window.__senkuroFarmCardState === 'closing') {
               window.__senkuroFarmCardState = 'idle';
             }
-            const candidates = [root];
-            for (const element of document.querySelectorAll('main, [role="main"], div')) {
-              const style = getComputedStyle(element);
-              const overflow = style.overflowY;
-              if ((overflow === 'auto' || overflow === 'scroll') &&
-                  element.scrollHeight > element.clientHeight + 100) {
-                candidates.push(element);
+            let scroller = window.__senkuroFarmScroller;
+            if (!scroller || !scroller.isConnected ||
+                scroller.scrollHeight <= scroller.clientHeight + 100) {
+              const candidates = [root];
+              for (const element of document.querySelectorAll('main, [role="main"], div')) {
+                const style = getComputedStyle(element);
+                const overflow = style.overflowY;
+                if ((overflow === 'auto' || overflow === 'scroll') &&
+                    element.scrollHeight > element.clientHeight + 100) {
+                  candidates.push(element);
+                }
               }
-            }
-            let scroller = candidates[0];
-            for (const candidate of candidates) {
-              const range = candidate.scrollHeight - candidate.clientHeight;
-              const bestRange = scroller.scrollHeight - scroller.clientHeight;
-              if (range > bestRange) scroller = candidate;
+              scroller = candidates[0];
+              for (const candidate of candidates) {
+                const range = candidate.scrollHeight - candidate.clientHeight;
+                const bestRange = scroller.scrollHeight - scroller.clientHeight;
+                if (range > bestRange) scroller = candidate;
+              }
+              window.__senkuroFarmScroller = scroller;
             }
             const isDocument = scroller === root;
             const viewport = isDocument ? window.innerHeight : scroller.clientHeight;
@@ -548,7 +629,7 @@ class FarmService : Service() {
             const max = Math.max(0, scroller.scrollHeight - viewport);
             const step = Math.max(180, Math.floor(viewport * 0.55));
             const atEnd = position >= max - 40;
-            if (atEnd && location.pathname.includes('/chapters/')) {
+            if (atEnd && /\/chapters\/[^/]+\/pages\//.test(location.pathname)) {
               const nextChapter =
                 document.querySelector('button[aria-label="Следующая глава"]:not([disabled])') ||
                 document.querySelector('.reader-chapters__arrow-right');
@@ -582,26 +663,121 @@ class FarmService : Service() {
         })();
     """.trimIndent()
 
-    private fun cardWatcherScript(): String = """
+    internal fun backgroundCardCollectorScript(): String = """
         (function() {
-          if (window.__senkuroFarmCardObserver) {
-            window.__senkuroFarmCardObserver.disconnect();
-          }
+          window.__senkuroFarmDispose && window.__senkuroFarmDispose();
           window.__senkuroFarmCardState = window.__senkuroFarmCardState || 'idle';
-          const checkCard = function() {
-            if (document.querySelector('.modal-container-drop')) return;
-            const drop = document.querySelector('img.cards-drop');
-            if (!drop || window.__senkuroFarmCardState === 'opening') return;
-            window.__senkuroFarmCardState = 'opening';
-            drop.click();
+          window.__senkuroFarmCardBusy = false;
+          window.__senkuroFarmCardReported = false;
+          const visible = element => {
+            if (!element || !element.isConnected) return false;
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return rect.width > 3 && rect.height > 3 &&
+              style.display !== 'none' && style.visibility !== 'hidden';
           };
-          window.__senkuroFarmCardObserver = new MutationObserver(checkCard);
+          const findDrop = () => [
+            ...document.querySelectorAll(
+              'img.cards-drop, .cards-drop, [class*="cards-drop"], ' +
+              '[class*="CardDrop"]:not([class*="Modal"]), [data-card-drop]'
+            )
+          ].find(element => visible(element) && !element.closest(
+            '.modal-container-drop, [class*="CardDropModal"], [role="dialog"]'
+          ));
+          const findModal = () => {
+            const direct = document.querySelector(
+              '.modal-container-drop, [class*="CardDropModal"], [class*="card-drop-modal"]'
+            );
+            if (direct) return direct;
+            return [...document.querySelectorAll('[role="dialog"]')]
+              .find(dialog => dialog.querySelector('.collectible-card'));
+          };
+          const describe = modal => {
+            const cardName =
+              modal?.querySelector('.collectible-card__front img')?.getAttribute('alt') ||
+              modal?.querySelector('.collectible-card img')?.getAttribute('alt') ||
+              modal?.querySelector('img[alt]')?.getAttribute('alt') ||
+              'Карточка';
+            const cardLink = modal?.querySelector('a.collectible-card')?.getAttribute('href') || '';
+            const rankMatch = cardLink.match(/-((?:sr)|[sabcdef])$/i);
+            const cardRank =
+              modal?.querySelector('[data-rank]')?.getAttribute('data-rank') ||
+              rankMatch?.[1]?.toUpperCase() ||
+              '?';
+            return { cardName, cardRank };
+          };
+          const clickElement = element => {
+            const target = element?.closest('button, a, [role="button"]') || element;
+            if (!target) return;
+            const rect = target.getBoundingClientRect();
+            const x = Math.floor(rect.left + rect.width / 2);
+            const y = Math.floor(rect.top + rect.height / 2);
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+              target.dispatchEvent(new MouseEvent(type, {
+                bubbles: true, cancelable: true, clientX: x, clientY: y
+              }));
+            }
+          };
+          const closeModal = modal => {
+            const info = describe(modal);
+            const x = Math.floor(window.innerWidth / 2);
+            const y = Math.max(1, window.innerHeight - 12);
+            const target = document.elementFromPoint(x, y) || modal;
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+              target.dispatchEvent(new MouseEvent(type, {
+                bubbles: true, cancelable: true, clientX: x, clientY: y
+              }));
+            }
+            if (!window.__senkuroFarmCardReported) {
+              window.__senkuroFarmCardReported = true;
+              if (window.SenkuroFarmNative?.onCardCollected) {
+                window.SenkuroFarmNative.onCardCollected(info.cardName, info.cardRank);
+              }
+            }
+            window.__senkuroFarmCardState = 'closing';
+          };
+          const checkCard = function() {
+            const modal = findModal();
+            if (modal) {
+              window.__senkuroFarmCardBusy = true;
+              closeModal(modal);
+              return;
+            }
+            if (window.__senkuroFarmCardState === 'closing') {
+              window.__senkuroFarmCardState = 'idle';
+              window.__senkuroFarmCardBusy = false;
+              window.__senkuroFarmCardReported = false;
+            }
+            const drop = findDrop();
+            if (!drop) {
+              window.__senkuroFarmCardBusy = false;
+              return;
+            }
+            window.__senkuroFarmCardBusy = true;
+            window.__senkuroFarmCardState = 'opening';
+            clickElement(drop);
+          };
+          let queued = false;
+          window.__senkuroFarmCardObserver = new MutationObserver(function() {
+            if (queued) return;
+            queued = true;
+            requestAnimationFrame(function() {
+              queued = false;
+              checkCard();
+            });
+          });
           window.__senkuroFarmCardObserver.observe(document.documentElement, {
             childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class', 'src']
+            subtree: true
           });
+          window.__senkuroFarmCardTimer = setInterval(checkCard, 350);
+          window.__senkuroFarmDispose = function() {
+            window.__senkuroFarmCardObserver?.disconnect();
+            clearInterval(window.__senkuroFarmCardTimer);
+            window.__senkuroFarmCardObserver = null;
+            window.__senkuroFarmCardTimer = null;
+            window.__senkuroFarmScroller = null;
+          };
           checkCard();
         })();
     """.trimIndent()
@@ -684,10 +860,13 @@ class FarmService : Service() {
     companion object {
         const val ACTION_START = "com.example.senkurofarm.action.START_FARM"
         const val ACTION_STOP = "com.example.senkurofarm.action.STOP_FARM"
+        const val ACTION_RECORD_CARD = "com.example.senkurofarm.action.RECORD_CARD"
         const val EXTRA_MANGA_TITLE = "manga_title"
         const val EXTRA_MANGA_URL = "manga_url"
         const val EXTRA_THREADS = "threads"
         const val EXTRA_DELAY_SECONDS = "delay_seconds"
+        const val EXTRA_CARD_NAME = "card_name"
+        const val EXTRA_CARD_RANK = "card_rank"
 
         const val PREFS = "senkuro_farm_service"
         const val KEY_RUNNING = "running"
@@ -704,12 +883,16 @@ class FarmService : Service() {
         private const val KEY_THREADS = "threads"
         private const val KEY_DELAY_SECONDS = "delay_seconds"
         private const val KEY_ACCUMULATED_RUNTIME_MS = "accumulated_runtime_ms"
+        private const val KEY_LAST_CARD_FINGERPRINT = "last_card_fingerprint"
+        private const val KEY_LAST_CARD_RECORDED_AT = "last_card_recorded_at"
 
         private const val CHANNEL_ID = "senkuro_farm"
         private const val NOTIFICATION_ID = 1001
         private const val LOG_TAG = "SenkuroFarm"
-        private const val WEBVIEW_RECYCLE_CHAPTERS = 20
+        private const val WEBVIEW_RECYCLE_CHAPTERS = 10
+        private const val WEBVIEW_RECYCLE_INTERVAL_MS = 10 * 60_000L
         private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60_000L
+        private const val CARD_DEDUPE_WINDOW_MS = 15_000L
 
         val CARD_RANKS = listOf("SR", "S", "A", "B", "C", "D", "F")
         fun botRankKey(rank: String) = "bot_rank_${rank.lowercase()}"
