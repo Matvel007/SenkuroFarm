@@ -2,6 +2,7 @@ package com.example.senkurofarm
 
 import android.Manifest
 import android.app.ActivityManager
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -129,6 +130,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -180,9 +182,23 @@ private data class CardsPage(
 
 private data class CachedCardsPage(val page: CardsPage, val savedAt: Long)
 
+private class FarmWebBridge(
+    private val mainHandler: Handler,
+    private val onUrlChanged: (String) -> Unit
+) {
+    @JavascriptInterface
+    fun onUrlChanged(url: String?) {
+        url?.takeIf { it.isNotBlank() }?.let { value ->
+            mainHandler.post { onUrlChanged(value) }
+        }
+    }
+}
+
 private const val CARDS_PAGE_SIZE = 20
 private const val GRAPHQL_URL = "https://api.senkuro.me/graphql"
 private const val CARDS_CACHE_TTL_MS = 10 * 60 * 1000L
+private val networkClient = OkHttpClient()
+private val graphQlUserIdCache = ConcurrentHashMap<String, String>()
 
 private val darkScheme = darkColorScheme(
     primary = Color(0xFF9D7BFF),
@@ -1375,6 +1391,7 @@ private fun FarmScreen(
 }
 
 @Composable
+@SuppressLint("JavascriptInterface")
 private fun FarmSiteWebView(
     isFarming: Boolean,
     isVisible: Boolean,
@@ -1385,16 +1402,7 @@ private fun FarmSiteWebView(
 ) {
     val appContext = LocalContext.current.applicationContext
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
-    val bridge = remember {
-        object {
-            @JavascriptInterface
-            fun onUrlChanged(url: String?) {
-                url?.takeIf { it.isNotBlank() }?.let { value ->
-                    mainHandler.post { onUrlChanged(value) }
-                }
-            }
-        }
-    }
+    val bridge = remember(onUrlChanged) { FarmWebBridge(mainHandler, onUrlChanged) }
     AndroidView(
         modifier = modifier
             .fillMaxWidth()
@@ -1847,7 +1855,7 @@ private fun showCardsPage(
 }
 
 private fun cardsCacheKey(profileUrl: String, page: Int): String =
-    "cards_v2_${normalizeProfileUrl(profileUrl).hashCode()}_$page"
+    "cards_v3_${normalizeProfileUrl(profileUrl).hashCode()}_$page"
 
 private fun loadCachedCardsPage(context: Context, profileUrl: String, page: Int): CachedCardsPage? {
     val raw = context.getSharedPreferences("senkuro_cards_cache", Context.MODE_PRIVATE)
@@ -1963,7 +1971,9 @@ private suspend fun loadProfileCards(profileUrl: String, page: Int): CardsPage =
             .header("Pragma", "no-cache")
             .apply { if (cookie.isNotBlank()) header("Cookie", cookie) }
             .build()
-        val html = OkHttpClient().newCall(request).execute().body?.string().orEmpty()
+        val html = networkClient.newCall(request).execute().use { response ->
+            response.body?.string().orEmpty()
+        }
         val cards = parseProfileCards(html)
         CardsPage(cards = cards, endCursor = null, hasNextPage = false)
     }.getOrElse { CardsPage(cards = emptyList(), endCursor = null, hasNextPage = false) }
@@ -1996,7 +2006,7 @@ private fun loadProfileCardsGraphQlPage(profileUrl: String, page: Int): CardsPag
 }
 
 private fun loadProfileCardsGraphQl(profileUrl: String, after: String?): CardsPage? {
-    val userId = extractGraphQlUserId(profileUrl) ?: return null
+    val userId = resolveGraphQlUserId(profileUrl) ?: return null
     val cookie = CookieManager.getInstance().getCookie("https://senkuro.me").orEmpty()
     val query = """
         query fetchUserCards(${'$'}userId: ID!, ${'$'}after: String) {
@@ -2032,7 +2042,10 @@ private fun loadProfileCardsGraphQl(profileUrl: String, after: String?): CardsPa
         .apply { if (cookie.isNotBlank()) header("Cookie", cookie) }
         .post(payload.toRequestBody("application/json".toMediaType()))
         .build()
-    val body = OkHttpClient().newCall(request).execute().body?.string().orEmpty()
+    val body = networkClient.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) return null
+        response.body?.string().orEmpty()
+    }
     val root = JSONObject(body)
     val userCards = root.optJSONObject("data")?.optJSONObject("userCards") ?: return null
     val edges = userCards.optJSONArray("edges") ?: return null
@@ -2070,10 +2083,42 @@ private fun loadProfileCardsGraphQl(profileUrl: String, after: String?): CardsPa
     )
 }
 
-private fun extractGraphQlUserId(profileUrl: String): String? {
-    val numericId = Regex("/users/@(\\d+)").find(normalizeProfileUrl(profileUrl))?.groupValues?.getOrNull(1) ?: return null
-    return Base64.encodeToString("USER:$numericId".toByteArray(), Base64.NO_WRAP or Base64.NO_PADDING)
+private fun resolveGraphQlUserId(profileUrl: String): String? {
+    val profileSlug = extractProfileSlug(profileUrl) ?: return null
+    graphQlUserIdCache[profileSlug]?.let { return it }
+    if (profileSlug.startsWith("@")) {
+        val numericId = profileSlug.removePrefix("@").takeIf { it.all(Char::isDigit) } ?: return null
+        return Base64.encodeToString(
+            "USER:$numericId".toByteArray(),
+            Base64.NO_WRAP or Base64.NO_PADDING
+        ).also { graphQlUserIdCache[profileSlug] = it }
+    }
+    val query = "query resolveUserId(\$slug: String!) { user(slug: \$slug) { id } }"
+    val payload = JSONObject()
+        .put("query", query)
+        .put("variables", JSONObject().put("slug", profileSlug))
+        .toString()
+    val request = Request.Builder()
+        .url(GRAPHQL_URL)
+        .header("User-Agent", "Mozilla/5.0 (Android) SenkuroFarm/1.0")
+        .header("Content-Type", "application/json")
+        .post(payload.toRequestBody("application/json".toMediaType()))
+        .build()
+    return networkClient.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) return null
+        JSONObject(response.body?.string().orEmpty())
+            .optJSONObject("data")
+            ?.optJSONObject("user")
+            ?.optString("id")
+            ?.takeIf { it.isNotBlank() }
+    }?.also { graphQlUserIdCache[profileSlug] = it }
 }
+
+internal fun extractProfileSlug(profileUrl: String): String? =
+    Regex("/users/(@\\d+|[A-Za-z0-9_.-]+)")
+        .find(normalizeProfileUrl(profileUrl))
+        ?.groupValues
+        ?.getOrNull(1)
 
 private fun readLocalizedTitle(titles: org.json.JSONArray?): String {
     if (titles == null) return ""

@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.annotation.TargetApi
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
@@ -109,7 +110,7 @@ class FarmService : Service() {
         chapterTransitions = 0
         acquireWakeLock()
         saveRunning(true, "Фарм запускается")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
                 buildNotification("запускается"),
@@ -168,6 +169,7 @@ class FarmService : Service() {
                             Log.d(LOG_TAG, "webView[$index] loaded $url")
                         }
 
+                        @TargetApi(Build.VERSION_CODES.O)
                         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                             Log.e(
                                 LOG_TAG,
@@ -279,7 +281,7 @@ class FarmService : Service() {
             "$LOG_TAG:FarmWakeLock"
         ).apply {
             setReferenceCounted(false)
-            acquire()
+            acquire(WAKE_LOCK_TIMEOUT_MS)
         }
     }
 
@@ -413,6 +415,7 @@ class FarmService : Service() {
 
     private fun checkFarmWatchdog() {
         if (farmJob?.isActive != true || recreatingWebViews) return
+        if (wakeLock?.isHeld != true) acquireWakeLock()
         val now = SystemClock.elapsedRealtime()
         val callbackTimeout = maxOf(90_000L, pageDelaySeconds * 15_000L)
         val progressTimeout = maxOf(4 * 60_000L, pageDelaySeconds * 60_000L)
@@ -706,6 +709,7 @@ class FarmService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val LOG_TAG = "SenkuroFarm"
         private const val WEBVIEW_RECYCLE_CHAPTERS = 20
+        private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60_000L
 
         val CARD_RANKS = listOf("SR", "S", "A", "B", "C", "D", "F")
         fun botRankKey(rank: String) = "bot_rank_${rank.lowercase()}"

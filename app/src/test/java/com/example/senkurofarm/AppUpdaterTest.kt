@@ -24,4 +24,5 @@ class AppUpdaterTest {
     fun missingPatchVersionEqualsZeroPatch() {
         assertEquals(0, AppUpdater.compareVersions("2.1", "2.1.0"))
     }
+
 }

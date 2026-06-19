@@ -3,6 +3,7 @@ package com.example.senkurofarm
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.annotation.TargetApi
 import android.net.Uri
 import android.os.Build
 import androidx.core.content.FileProvider
@@ -117,6 +118,7 @@ internal object AppUpdater {
         Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
             context.packageManager.canRequestPackageInstalls()
 
+    @TargetApi(Build.VERSION_CODES.O)
     fun unknownSourcesIntent(context: Context): Intent =
         Intent(
             android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
