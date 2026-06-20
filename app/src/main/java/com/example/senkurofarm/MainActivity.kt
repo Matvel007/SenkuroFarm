@@ -167,6 +167,7 @@ private data class FarmProgress(
     val position: Long = 0,
     val max: Long = 0,
     val ticks: Long = 0,
+    val sessionCards: Int = 0,
     val url: String = ""
 )
 
@@ -563,6 +564,7 @@ private fun loadFarmProgress(context: Context): FarmProgress {
         position = preferences.getLong(FarmService.KEY_SCROLL_POSITION, 0),
         max = preferences.getLong(FarmService.KEY_SCROLL_MAX, 0),
         ticks = preferences.getLong(FarmService.KEY_COMPLETED_TICKS, 0),
+        sessionCards = preferences.getInt(FarmService.KEY_SESSION_CARDS, 0),
         url = preferences.getString(FarmService.KEY_CURRENT_URL, "").orEmpty().ifBlank {
             preferences.getString(FarmService.EXTRA_MANGA_URL, "").orEmpty()
         }
@@ -1336,10 +1338,33 @@ private fun FarmScreen(
     var farmWebView by remember { mutableStateOf<WebView?>(null) }
     var delay by remember { mutableFloatStateOf(3f) }
     var controlsExpanded by remember { mutableStateOf(false) }
+    var pauseSiteRendering by remember { mutableStateOf(false) }
 
-    LaunchedEffect(isVisible, farmWebView) {
+    LaunchedEffect(isFarming) {
+        if (isFarming) {
+            controlsExpanded = false
+            delay(2_000)
+            pauseSiteRendering = true
+        } else {
+            pauseSiteRendering = false
+            delay(250)
+            val webView = farmWebView ?: return@LaunchedEffect
+            val restoredUrl = farmProgress.url.takeIf(::isReaderPageUrl)
+            if (restoredUrl != null &&
+                normalizeReaderLocation(webView.url.orEmpty()) != normalizeReaderLocation(restoredUrl)
+            ) {
+                webView.loadUrl(restoredUrl)
+                delay(1_200)
+            }
+            if (farmProgress.max > 0) {
+                webView.evaluateJavascript(syncFarmProgressScript(farmProgress), null)
+            }
+        }
+    }
+
+    LaunchedEffect(isVisible, pauseSiteRendering, farmWebView) {
         val webView = farmWebView ?: return@LaunchedEffect
-        while (isVisible) {
+        while (isVisible && !pauseSiteRendering) {
             webView.evaluateJavascript("location.href") { rawUrl ->
                 cleanJsString(rawUrl)
                     .takeIf { it.startsWith("https://senkuro.me/") }
@@ -1357,10 +1382,20 @@ private fun FarmScreen(
             farmProgress = farmProgress,
             onUrlChanged = { currentUrl = it },
             onWebViewReady = { farmWebView = it },
+            renderSite = !pauseSiteRendering,
             modifier = Modifier.fillMaxSize()
         )
 
-        if (isVisible && controlsExpanded) {
+        if (isVisible && isFarming) {
+            FarmingActiveScreen(
+                farmProgress = farmProgress,
+                farmMessage = farmMessage,
+                onStop = {
+                    onFarmingChange(false, currentUrl, 1, delay.toInt())
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else if (isVisible && controlsExpanded) {
             Card(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -1449,6 +1484,116 @@ private fun FarmScreen(
 }
 
 @Composable
+private fun FarmingActiveScreen(
+    farmProgress: FarmProgress,
+    farmMessage: String,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(112.dp),
+                    strokeWidth = 7.dp
+                )
+                Surface(
+                    modifier = Modifier.size(72.dp),
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primaryContainer
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Rounded.FlashOn,
+                            contentDescription = null,
+                            modifier = Modifier.size(38.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(28.dp))
+            Text(
+                "Фарм работает",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Black
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Сайт временно скрыт для снижения нагрузки",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(24.dp))
+            Card(
+                shape = RoundedCornerShape(22.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        "Шаг ${farmProgress.ticks}",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "Карт за сессию: ${farmProgress.sessionCards}",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        "Позиция ${farmProgress.position}/${farmProgress.max}",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (farmMessage.isNotBlank()) {
+                        Text(
+                            farmMessage,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(28.dp))
+            Button(
+                onClick = onStop,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE5484D))
+            ) {
+                Icon(Icons.Rounded.Stop, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Остановить фарм")
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "После остановки книга откроется на текущем месте",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+@Composable
 @SuppressLint("JavascriptInterface")
 private fun FarmSiteWebView(
     isFarming: Boolean,
@@ -1457,6 +1602,7 @@ private fun FarmSiteWebView(
     farmProgress: FarmProgress,
     onUrlChanged: (String) -> Unit,
     onWebViewReady: (WebView) -> Unit,
+    renderSite: Boolean,
     modifier: Modifier = Modifier
 ) {
     val appContext = LocalContext.current.applicationContext
@@ -1485,7 +1631,7 @@ private fun FarmSiteWebView(
                 settings.databaseEnabled = true
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                 addJavascriptInterface(bridge, "SenkuroFarm")
-                visibility = if (isVisible) View.VISIBLE else View.INVISIBLE
+                visibility = if (isVisible && renderSite) View.VISIBLE else View.GONE
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                         view.loadUrl(request.url.toString())
@@ -1512,8 +1658,22 @@ private fun FarmSiteWebView(
         },
         update = { webView ->
             onWebViewReady(webView)
-            webView.visibility = if (isVisible) View.VISIBLE else View.INVISIBLE
-            if (isVisible) webView.onResume() else webView.onPause()
+            webView.visibility = if (isVisible && renderSite) View.VISIBLE else View.GONE
+            if (isVisible && renderSite) webView.onResume() else webView.onPause()
+            if (!renderSite) {
+                webView.evaluateJavascript(
+                    """
+                        window.__senkuroVisibleCollectorDispose &&
+                          window.__senkuroVisibleCollectorDispose();
+                        if (window.__senkuroFarmUrlTimer) {
+                          clearInterval(window.__senkuroFarmUrlTimer);
+                          window.__senkuroFarmUrlTimer = null;
+                        }
+                    """.trimIndent(),
+                    null
+                )
+                return@AndroidView
+            }
             if (lastAppliedDelay[0] != delaySeconds) {
                 lastAppliedDelay[0] = delaySeconds
                 webView.evaluateJavascript(farmReaderScript(false, delaySeconds), null)

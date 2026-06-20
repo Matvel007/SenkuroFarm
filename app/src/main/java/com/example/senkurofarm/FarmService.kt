@@ -50,6 +50,7 @@ class FarmService : Service() {
     private var sessionTimeCommitted = false
     private var startedAt = 0L
     private var completedTicks = 0L
+    private var sessionCards = 0
     private var failedTicks = 0
     private var lastCallbackAt = 0L
     private var lastProgressAt = 0L
@@ -84,7 +85,7 @@ class FarmService : Service() {
 
         restoreOrUpdateConfiguration(intent)
         Log.d(LOG_TAG, "start farm url=$mangaUrl delay=$pageDelaySeconds threads=$threads")
-        startFarm()
+        startFarm(resetSessionCards = intent?.action == ACTION_START)
         return START_STICKY
     }
 
@@ -108,7 +109,7 @@ class FarmService : Service() {
         super.onDestroy()
     }
 
-    private fun startFarm() {
+    private fun startFarm(resetSessionCards: Boolean) {
         if (farmJob?.isActive == true) return
         if (!isReaderPageUrl(mangaUrl)) {
             saveRunning(false, "Откройте конкретную главу перед запуском")
@@ -118,6 +119,13 @@ class FarmService : Service() {
         startedAt = System.currentTimeMillis()
         sessionTimeCommitted = false
         completedTicks = 0
+        val preferences = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        sessionCards = if (resetSessionCards) {
+            preferences.edit().putInt(KEY_SESSION_CARDS, 0).apply()
+            0
+        } else {
+            preferences.getInt(KEY_SESSION_CARDS, 0)
+        }
         failedTicks = 0
         lastCallbackAt = SystemClock.elapsedRealtime()
         lastProgressAt = lastCallbackAt
@@ -415,9 +423,16 @@ class FarmService : Service() {
             .putLong(KEY_LAST_CARD_RECORDED_AT, now)
             .apply()
         val totalCards = incrementCards(rank)
+        if (farmJob?.isActive == true || preferences.getBoolean(KEY_RUNNING, false)) {
+            sessionCards += 1
+            preferences.edit().putInt(KEY_SESSION_CARDS, sessionCards).apply()
+        }
         saveRunning(true, "Собрана: $name · всего: $totalCards")
         updateNotification("карточка собрана")
-        Log.d(LOG_TAG, "card collected name=$name rank=$rank total=$totalCards")
+        Log.d(
+            LOG_TAG,
+            "card collected name=$name rank=$rank total=$totalCards session=$sessionCards"
+        )
     }
 
     private inner class FarmJavascriptBridge {
@@ -438,6 +453,7 @@ class FarmService : Service() {
             .putLong(KEY_SCROLL_POSITION, position)
             .putLong(KEY_SCROLL_MAX, max)
             .putLong(KEY_COMPLETED_TICKS, completedTicks)
+            .putInt(KEY_SESSION_CARDS, sessionCards)
             .putString(KEY_CURRENT_URL, url)
             .putLong(KEY_TOTAL_RUNTIME_MS, currentTotalRuntime())
             .apply()
@@ -883,6 +899,7 @@ class FarmService : Service() {
         const val KEY_SCROLL_POSITION = "scroll_position"
         const val KEY_SCROLL_MAX = "scroll_max"
         const val KEY_COMPLETED_TICKS = "completed_ticks"
+        const val KEY_SESSION_CARDS = "session_cards"
         const val KEY_CURRENT_URL = "current_url"
         const val KEY_CARDS = "cards"
         const val KEY_TOTAL_RUNTIME_MS = "total_runtime_ms"
