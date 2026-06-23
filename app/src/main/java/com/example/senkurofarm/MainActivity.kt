@@ -13,6 +13,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings as AndroidSettings
 import android.util.Base64
+import android.util.Log
 import android.view.View
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -20,11 +21,18 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.Keep
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -54,6 +62,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Article
 import androidx.compose.material.icons.rounded.BatterySaver
 import androidx.compose.material.icons.rounded.DarkMode
@@ -63,6 +72,7 @@ import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Login
 import androidx.compose.material.icons.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.People
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
@@ -110,6 +120,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.geometry.Offset
@@ -122,7 +133,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
+import coil.ImageLoader
 import coil.compose.AsyncImage
+import coil.decode.GifDecoder
+import coil.decode.ImageDecoderDecoder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -131,7 +145,10 @@ import okhttp3.OkHttpClient
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 
 class MainActivity : ComponentActivity() {
@@ -140,6 +157,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         CookieManager.getInstance().setAcceptCookie(true)
         restoreSenkuroCookies(this)
+        SenkuroApi.extractAccessToken(this)?.takeIf { it.isNotBlank() }?.let {
+            SenkuroApi.saveAccessToken(this, it)
+        }
         setContent { SenkuroFarmApp() }
     }
 }
@@ -153,6 +173,8 @@ private enum class Tab(val title: String, val icon: ImageVector) {
 }
 
 private data class CardItem(
+    val id: String = "",
+    val slug: String = "",
     val title: String,
     val rank: String,
     val imageUrl: String,
@@ -161,13 +183,39 @@ private data class CardItem(
     val modifier: Int = 0
 )
 
+private data class CardOwner(
+    val id: String,
+    val slug: String,
+    val name: String,
+    val avatarUrl: String,
+    val lastOnlineAt: String,
+    val level: Int,
+    val tradeReady: Boolean = false
+)
+
+private data class CardOwnersResult(
+    val owners: List<CardOwner>,
+    val totalOwners: Int
+)
+
+private data class CachedCardOwners(val result: CardOwnersResult, val savedAt: Long)
+
+private const val FARM_LIST_CACHE_TTL_MS = 6 * 60 * 60 * 1000L
+private const val FARM_CHAPTERS_CACHE_TTL_MS = 24 * 60 * 60 * 1000L
+
+private data class GraphQlHttpResponse(val code: Int, val body: String)
+
 private data class MangaItem(val title: String, val url: String)
 
 private data class FarmProgress(
+    val reads: Long = 0,
+    val claims: Long = 0,
+    val drops: Long = 0,
+    val errors: Long = 0,
+    val sessionCards: Int = 0,
     val position: Long = 0,
     val max: Long = 0,
     val ticks: Long = 0,
-    val sessionCards: Int = 0,
     val url: String = ""
 )
 
@@ -212,9 +260,38 @@ internal class FarmWebBridge(
 private const val CARDS_PAGE_SIZE = 20
 private const val GRAPHQL_URL = "https://api.senkuro.me/graphql"
 private const val CARDS_CACHE_TTL_MS = 10 * 60 * 1000L
+private const val CARD_OWNERS_CACHE_TTL_MS = 5 * 60 * 1000L
+private const val CARD_OWNERS_CACHE_MAX_ENTRIES = 12
+private const val CARD_OWNERS_MAX_RESULTS = 50
+private const val CARD_OWNERS_PAGE_SIZE = 10
 private const val VISIBLE_FARM_SYNC_INTERVAL_MS = 3_000L
 private val networkClient = OkHttpClient()
 private val graphQlUserIdCache = ConcurrentHashMap<String, String>()
+private val cardOwnersCache = object : LinkedHashMap<String, CachedCardOwners>(16, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedCardOwners>?): Boolean =
+        size > CARD_OWNERS_CACHE_MAX_ENTRIES
+}
+
+private fun postGraphQl(payload: String, cookie: String): GraphQlHttpResponse {
+    val connection = (URL(GRAPHQL_URL).openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"
+        connectTimeout = 15_000
+        readTimeout = 20_000
+        doOutput = true
+        setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36")
+        setRequestProperty("Content-Type", "application/json")
+        setRequestProperty("Accept", "application/json")
+        if (cookie.isNotBlank()) setRequestProperty("Cookie", cookie)
+    }
+    return try {
+        connection.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+        val code = connection.responseCode
+        val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+        GraphQlHttpResponse(code, stream?.bufferedReader()?.use { it.readText() }.orEmpty())
+    } finally {
+        connection.disconnect()
+    }
+}
 
 private val darkScheme = darkColorScheme(
     primary = Color(0xFF9D7BFF),
@@ -453,6 +530,7 @@ private fun SenkuroFarmApp() {
 private fun hasSenkuroSession(context: Context): Boolean {
     restoreSenkuroCookies(context)
     if (loadAuthorized(context)) return true
+    if (SenkuroApi.hasAccessToken(context)) return true
     val cookie = CookieManager.getInstance().getCookie("https://senkuro.me").orEmpty()
     val backup = loadSenkuroCookieBackup(context)
     val combined = "$cookie;$backup".lowercase()
@@ -497,6 +575,9 @@ private fun saveSenkuroCookies(context: Context) {
     cookieManager.flush()
     val cookies = cookieManager.getCookie("https://senkuro.me").orEmpty()
     if (cookies.isNotBlank()) saveSenkuroCookieBackup(context, cookies)
+    SenkuroApi.extractAccessToken(context)?.takeIf { it.isNotBlank() }?.let {
+        SenkuroApi.saveAccessToken(context, it)
+    }
 }
 
 private fun restoreSenkuroCookies(context: Context) {
@@ -514,18 +595,35 @@ private fun restoreSenkuroCookies(context: Context) {
     cookieManager.flush()
 }
 
-private fun startFarmService(context: Context, mangaUrl: String, threads: Int, delaySeconds: Int) {
+private fun startFarmService(
+    context: Context,
+    manga: ApiManga,
+    chapter: ApiChapter,
+    delaySeconds: Int
+) {
     val intent = Intent(context, FarmService::class.java)
         .setAction(FarmService.ACTION_START)
-        .putExtra(FarmService.EXTRA_MANGA_TITLE, "Книга")
-        .putExtra(FarmService.EXTRA_MANGA_URL, mangaUrl)
-        .putExtra(FarmService.EXTRA_THREADS, threads)
-        .putExtra(FarmService.EXTRA_DELAY_SECONDS, delaySeconds)
+        .putExtra(FarmService.EXTRA_MANGA_TITLE, manga.title)
+        .putExtra(FarmService.EXTRA_MANGA_ID, manga.id)
+        .putExtra(FarmService.EXTRA_BRANCH_ID, manga.branchId)
+        .putExtra(FarmService.EXTRA_CHAPTER_ID, chapter.id)
+        .putExtra(FarmService.EXTRA_CHAPTER_NUMBER, chapter.number)
+        .putExtra(FarmService.EXTRA_ACCESS_TOKEN, SenkuroApi.loadAccessToken(context))
+        .putExtra(FarmService.EXTRA_CLAIM_DELAY_SECONDS, delaySeconds)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         context.startForegroundService(intent)
     } else {
         context.startService(intent)
     }
+}
+
+private fun startFarmService(
+    context: Context,
+    mangaUrl: String,
+    threads: Int,
+    delaySeconds: Int
+) {
+    Log.d("SenkuroFarm", "legacy farm start ignored: $mangaUrl threads=$threads delay=$delaySeconds")
 }
 
 private fun stopFarmService(context: Context) {
@@ -534,17 +632,17 @@ private fun stopFarmService(context: Context) {
 }
 
 private fun recordVisibleCard(context: Context, name: String, rank: String) {
-    context.startService(
-        Intent(context, FarmService::class.java)
-            .setAction(FarmService.ACTION_RECORD_CARD)
-            .putExtra(FarmService.EXTRA_CARD_NAME, name)
-            .putExtra(FarmService.EXTRA_CARD_RANK, rank)
-    )
+    Log.d("SenkuroFarm", "visible card ignored in API farm: $name $rank")
 }
 
-private fun isFarmServiceRunning(context: Context): Boolean =
-    context.getSharedPreferences(FarmService.PREFS, Context.MODE_PRIVATE)
-        .getBoolean(FarmService.KEY_RUNNING, false) && isFarmServiceProcessRunning(context)
+private fun isFarmServiceRunning(context: Context): Boolean {
+    val prefs = context.getSharedPreferences(FarmService.PREFS, Context.MODE_PRIVATE)
+    val markedRunning = prefs.getBoolean(FarmService.KEY_RUNNING, false)
+    if (!markedRunning) return false
+    val processRunning = isFarmServiceProcessRunning(context)
+    if (!processRunning) prefs.edit().putBoolean(FarmService.KEY_RUNNING, false).putLong(FarmService.KEY_STARTED_AT, 0L).apply()
+    return processRunning
+}
 
 private fun isFarmServiceProcessRunning(context: Context): Boolean {
     val manager = context.getSystemService(ActivityManager::class.java)
@@ -561,13 +659,11 @@ private fun loadFarmServiceMessage(context: Context): String =
 private fun loadFarmProgress(context: Context): FarmProgress {
     val preferences = context.getSharedPreferences(FarmService.PREFS, Context.MODE_PRIVATE)
     return FarmProgress(
-        position = preferences.getLong(FarmService.KEY_SCROLL_POSITION, 0),
-        max = preferences.getLong(FarmService.KEY_SCROLL_MAX, 0),
-        ticks = preferences.getLong(FarmService.KEY_COMPLETED_TICKS, 0),
-        sessionCards = preferences.getInt(FarmService.KEY_SESSION_CARDS, 0),
-        url = preferences.getString(FarmService.KEY_CURRENT_URL, "").orEmpty().ifBlank {
-            preferences.getString(FarmService.EXTRA_MANGA_URL, "").orEmpty()
-        }
+        reads = preferences.getLong(FarmService.KEY_READS, 0),
+        claims = preferences.getLong(FarmService.KEY_CLAIMS, 0),
+        drops = preferences.getLong(FarmService.KEY_DROPS, 0),
+        errors = preferences.getLong(FarmService.KEY_ERRORS, 0),
+        sessionCards = preferences.getInt(FarmService.KEY_SESSION_CARDS, 0)
     )
 }
 
@@ -575,11 +671,86 @@ private fun loadFarmStatistics(context: Context): FarmStatistics {
     val preferences = context.getSharedPreferences(FarmService.PREFS, Context.MODE_PRIVATE)
     return FarmStatistics(
         runtimeMs = preferences.getLong(FarmService.KEY_TOTAL_RUNTIME_MS, 0L),
-        botCards = preferences.getInt(FarmService.KEY_CARDS, 0),
+        botCards = preferences.getInt(FarmService.KEY_SESSION_CARDS, 0),
         botRanks = FarmService.CARD_RANKS.associateWith {
             preferences.getInt(FarmService.botRankKey(it), 0)
         }
     )
+}
+
+private fun resetFarmStatistics(context: Context) {
+    val editor = context.getSharedPreferences(FarmService.PREFS, Context.MODE_PRIVATE).edit()
+        .putLong(FarmService.KEY_TOTAL_RUNTIME_MS, 0L)
+        .putLong("accumulated_runtime_ms", 0L)
+        .putLong(FarmService.KEY_READS, 0L)
+        .putLong(FarmService.KEY_CLAIMS, 0L)
+        .putLong(FarmService.KEY_DROPS, 0L)
+        .putLong(FarmService.KEY_ERRORS, 0L)
+        .putInt(FarmService.KEY_SESSION_CARDS, 0)
+        .putInt(FarmService.KEY_CARDS, 0)
+        .putBoolean(FarmService.KEY_RUNNING, false)
+        .putLong(FarmService.KEY_STARTED_AT, 0L)
+        .putString(FarmService.KEY_LAST_MESSAGE, "")
+    FarmService.CARD_RANKS.forEach { editor.putInt(FarmService.botRankKey(it), 0) }
+    editor.apply()
+}
+
+private fun loadCachedFarmManga(context: Context): List<ApiManga> {
+    val prefs = context.getSharedPreferences("senkuro_farm", Context.MODE_PRIVATE)
+    val savedAt = prefs.getLong("farm_manga_saved_at", 0L)
+    if (System.currentTimeMillis() - savedAt > FARM_LIST_CACHE_TTL_MS) return emptyList()
+    val raw = prefs.getString("farm_manga_cache", "").orEmpty()
+    if (raw.isBlank()) return emptyList()
+    return runCatching {
+        val arr = JSONArray(raw)
+        (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            ApiManga(
+                id = o.optString("id"),
+                slug = o.optString("slug"),
+                title = o.optString("title"),
+                branchId = o.optString("branchId")
+            ).takeIf { it.slug.isNotBlank() && it.title.isNotBlank() }
+        }
+    }.getOrDefault(emptyList())
+}
+
+private fun saveCachedFarmManga(context: Context, list: List<ApiManga>) {
+    val arr = JSONArray()
+    list.take(10).forEach { m ->
+        arr.put(JSONObject().put("id", m.id).put("slug", m.slug).put("title", m.title).put("branchId", m.branchId))
+    }
+    context.getSharedPreferences("senkuro_farm", Context.MODE_PRIVATE).edit()
+        .putString("farm_manga_cache", arr.toString())
+        .putLong("farm_manga_saved_at", System.currentTimeMillis())
+        .apply()
+}
+
+private fun loadCachedFarmChapters(context: Context, branchId: String): List<ApiChapter> {
+    val prefs = context.getSharedPreferences("senkuro_farm", Context.MODE_PRIVATE)
+    val key = "farm_chapters_${branchId.hashCode()}"
+    val savedAt = prefs.getLong("${key}_saved_at", 0L)
+    if (System.currentTimeMillis() - savedAt > FARM_CHAPTERS_CACHE_TTL_MS) return emptyList()
+    val raw = prefs.getString(key, "").orEmpty()
+    if (raw.isBlank()) return emptyList()
+    return runCatching {
+        val arr = JSONArray(raw)
+        (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            ApiChapter(id = o.optString("id"), number = o.optInt("number", 0))
+                .takeIf { it.id.isNotBlank() && it.number > 0 }
+        }.distinctBy { it.id }.sortedBy { it.number }
+    }.getOrDefault(emptyList())
+}
+
+private fun saveCachedFarmChapters(context: Context, branchId: String, list: List<ApiChapter>) {
+    val arr = JSONArray()
+    list.forEach { c -> arr.put(JSONObject().put("id", c.id).put("number", c.number)) }
+    val key = "farm_chapters_${branchId.hashCode()}"
+    context.getSharedPreferences("senkuro_farm", Context.MODE_PRIVATE).edit()
+        .putString(key, arr.toString())
+        .putLong("${key}_saved_at", System.currentTimeMillis())
+        .apply()
 }
 
 @Composable
@@ -873,6 +1044,14 @@ private fun MainShell(
     var accountRankStats by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     var accountCardsTotal by remember { mutableIntStateOf(0) }
     var accountStatsLoading by remember { mutableStateOf(false) }
+    var selectedCard by remember { mutableStateOf<CardItem?>(null) }
+    var selectedOwner by remember { mutableStateOf<CardOwner?>(null) }
+    var webProfileOwner by remember { mutableStateOf<CardOwner?>(null) }
+    val ownerPages = remember { mutableStateMapOf<String, Int>() }
+
+    BackHandler(enabled = webProfileOwner != null) { webProfileOwner = null }
+    BackHandler(enabled = selectedOwner != null && webProfileOwner == null) { selectedOwner = null }
+    BackHandler(enabled = selectedCard != null && selectedOwner == null && webProfileOwner == null) { selectedCard = null }
 
     LaunchedEffect(initialProfileUrl, externalReloadKey) {
         if (initialProfileUrl.isNotBlank() && initialProfileUrl != profileUrl) {
@@ -978,32 +1157,59 @@ private fun MainShell(
         topBar = {
             if (selectedTab != Tab.Farm) {
                 CenterAlignedTopAppBar(
-                    title = { Text("Senkuro Farm", fontWeight = FontWeight.Black) },
+                    title = {
+                        Text(
+                            when {
+                                webProfileOwner != null -> "Профиль Senkuro"
+                                selectedOwner != null -> "Карта в коллекции"
+                                selectedCard != null -> "Владельцы карты"
+                                else -> "Senkuro Farm"
+                            },
+                            fontWeight = FontWeight.Black
+                        )
+                    },
+                    navigationIcon = {
+                        if (selectedCard != null) {
+                            IconButton(onClick = {
+                                when {
+                                    webProfileOwner != null -> webProfileOwner = null
+                                    selectedOwner != null -> selectedOwner = null
+                                    else -> selectedCard = null
+                                }
+                            }) {
+                                Icon(Icons.Rounded.ArrowBack, contentDescription = "Назад")
+                            }
+                        }
+                    },
                     colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
                         containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
                     ),
                     actions = {
-                        IconButton(onClick = onOpenSession) {
-                            Icon(Icons.Rounded.Login, contentDescription = "Открыть Senkuro")
+                        if (selectedCard == null) {
+                            IconButton(onClick = onOpenSession) {
+                                Icon(Icons.Rounded.Login, contentDescription = "Открыть Senkuro")
+                            }
                         }
                     }
                 )
             }
         },
         bottomBar = {
-            NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
-                Tab.entries.forEach { tab ->
-                    NavigationBarItem(
-                        selected = selectedTab == tab,
-                        onClick = { selectedTab = tab },
-                        icon = { Icon(tab.icon, contentDescription = tab.title) },
-                        label = { Text(tab.title) }
-                    )
+            if (selectedCard == null) {
+                NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                    Tab.entries.forEach { tab ->
+                        NavigationBarItem(
+                            selected = selectedTab == tab,
+                            onClick = { selectedTab = tab },
+                            icon = { Icon(tab.icon, contentDescription = tab.title) },
+                            label = { Text(tab.title) }
+                        )
+                    }
                 }
             }
         }
     ) { padding ->
-        Box(modifier = Modifier.padding(padding)) {
+        AppBackground(modifier = Modifier.padding(padding)) {
             FarmScreen(
                 isFarming = isFarming,
                 isVisible = selectedTab == Tab.Farm,
@@ -1012,7 +1218,12 @@ private fun MainShell(
                 onFarmingChange = { running, mangaUrl, threads, delaySeconds ->
                     isFarming = running
                     if (running) {
-                        startFarmService(context, mangaUrl, threads, delaySeconds)
+                        startFarmService(
+                            context = context,
+                            mangaUrl = mangaUrl,
+                            threads = threads,
+                            delaySeconds = delaySeconds
+                        )
                     } else {
                         stopFarmService(context)
                     }
@@ -1022,40 +1233,60 @@ private fun MainShell(
                     .zIndex(if (selectedTab == Tab.Farm) 1f else 0f)
             )
             when (selectedTab) {
-                Tab.Home -> HomeScreen(
-                    modifier = Modifier.zIndex(2f),
-                    cards = cards,
-                    isLoading = isLoadingCards,
-                    profileUrl = profileUrl,
-                    profileInput = profileInput,
-                    cardsStatus = cardsStatus,
-                    cardsPage = cardsPage,
-                    hasNextCardsPage = hasNextCardsPage,
-                    onProfileUrlChange = { profileInput = it },
-                    onProfileUrlApply = {
-                        profileUrl = profileInput
-                        cardsPage = 1
-                        cardsPageCursors.clear()
-                        cardsPageCache.clear()
-                        onProfileUrlSaved(profileInput)
-                        cardsReloadKey += 1
-                    },
-                    onRefresh = {
-                        cardsPageCache.remove(cardsPage)
-                        clearCachedCardsPage(context, profileUrl, cardsPage)
-                        cardsReloadKey += 1
-                    },
-                    onPreviousPage = {
-                        if (cardsPage > 1) {
-                            cardsPage -= 1
+                Tab.Home -> when {
+                    webProfileOwner != null -> ProfileWebScreen(
+                        owner = webProfileOwner!!,
+                        modifier = Modifier.zIndex(2f)
+                    )
+                    selectedCard == null -> HomeScreen(
+                        modifier = Modifier.zIndex(2f),
+                        cards = cards,
+                        isLoading = isLoadingCards,
+                        profileUrl = profileUrl,
+                        profileInput = profileInput,
+                        cardsStatus = cardsStatus,
+                        cardsPage = cardsPage,
+                        hasNextCardsPage = hasNextCardsPage,
+                        onProfileUrlChange = { profileInput = it },
+                        onProfileUrlApply = {
+                            profileUrl = profileInput
+                            cardsPage = 1
+                            cardsPageCursors.clear()
+                            cardsPageCache.clear()
+                            onProfileUrlSaved(profileInput)
+                            cardsReloadKey += 1
+                        },
+                        onRefresh = {
+                            cardsPageCache.remove(cardsPage)
+                            clearCachedCardsPage(context, profileUrl, cardsPage)
+                            cardsReloadKey += 1
+                        },
+                        onPreviousPage = {
+                            if (cardsPage > 1) cardsPage -= 1
+                        },
+                        onNextPage = {
+                            if (hasNextCardsPage) cardsPage += 1
+                        },
+                        onCardClick = {
+                            selectedCard = it
+                            ownerPages[it.slug] = 0
                         }
-                    },
-                    onNextPage = {
-                        if (hasNextCardsPage) {
-                            cardsPage += 1
-                        }
-                    }
-                )
+                    )
+                    selectedOwner == null -> CardOwnersScreen(
+                        card = selectedCard!!,
+                        ownerPage = ownerPages[selectedCard!!.slug] ?: 0,
+                        onOwnerPageChange = { ownerPages[selectedCard!!.slug] = it },
+                        onOwnerClick = { selectedOwner = it },
+                        onOpenProfile = { webProfileOwner = it },
+                        modifier = Modifier.zIndex(2f)
+                    )
+                    else -> OwnerCardScreen(
+                        card = selectedCard!!,
+                        owner = selectedOwner!!,
+                        onOpenProfile = { webProfileOwner = selectedOwner },
+                        modifier = Modifier.zIndex(2f)
+                    )
+                }
                 Tab.Farm -> Unit
                 Tab.Statistics -> StatisticsScreen(
                     farmStatistics = farmStatistics,
@@ -1064,7 +1295,11 @@ private fun MainShell(
                     accountStatsLoading = accountStatsLoading,
                     modifier = Modifier.zIndex(2f)
                 )
-                Tab.Settings -> SettingsScreen(darkTheme = darkTheme, onDarkThemeChange = onDarkThemeChange, modifier = Modifier.zIndex(2f))
+                Tab.Settings -> SettingsScreen(
+                    darkTheme = darkTheme,
+                    onDarkThemeChange = onDarkThemeChange,
+                    modifier = Modifier.zIndex(2f)
+                )
                 Tab.Info -> InfoScreen(
                     onOpenLicense = onOpenLicense,
                     currentVersion = currentVersion,
@@ -1074,6 +1309,46 @@ private fun MainShell(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun AppBackground(
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit
+) {
+    val dark = MaterialTheme.colorScheme.background == Color(0xFF0C0D12)
+    val bg = if (dark) {
+        Brush.verticalGradient(listOf(Color(0xFF07080F), Color(0xFF111022), Color(0xFF201633)))
+    } else {
+        Brush.verticalGradient(listOf(Color(0xFFF8F5FF), Color(0xFFEDE7FF), Color(0xFFFFFBFE)))
+    }
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(bg)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(220.dp)
+                .align(Alignment.TopEnd)
+                .background(
+                    Brush.radialGradient(
+                        listOf(MaterialTheme.colorScheme.primary.copy(alpha = if (dark) 0.22f else 0.13f), Color.Transparent)
+                    )
+                )
+        )
+        Box(
+            modifier = Modifier
+                .size(260.dp)
+                .align(Alignment.BottomStart)
+                .background(
+                    Brush.radialGradient(
+                        listOf(MaterialTheme.colorScheme.secondary.copy(alpha = if (dark) 0.10f else 0.08f), Color.Transparent)
+                    )
+                )
+        )
+        content()
     }
 }
 
@@ -1091,22 +1366,21 @@ private fun HomeScreen(
     onProfileUrlApply: () -> Unit,
     onRefresh: () -> Unit,
     onPreviousPage: () -> Unit,
-    onNextPage: () -> Unit
+    onNextPage: () -> Unit,
+    onCardClick: (CardItem) -> Unit
 ) {
     var showProfileEditor by remember(profileUrl) { mutableStateOf(profileUrl.isBlank()) }
 
-    Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("Коллекция карт", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Black)
-                Text(cardsStatus)
-                if (profileUrl.isNotBlank()) {
-                    Text("Профиль: $profileUrl", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-                }
-            }
+    Column(modifier = modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("Карты", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Black, modifier = Modifier.weight(1f))
             IconButton(onClick = onRefresh) { Icon(Icons.Rounded.Refresh, contentDescription = "Обновить") }
+            OutlinedButton(onClick = { showProfileEditor = true }) { Text("Профиль") }
         }
-        Spacer(Modifier.height(12.dp))
         if (showProfileEditor) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
@@ -1122,10 +1396,7 @@ private fun HomeScreen(
                     onProfileUrlApply()
                 }) { Text("OK") }
             }
-            Spacer(Modifier.height(12.dp))
-        } else {
-            OutlinedButton(onClick = { showProfileEditor = true }) { Text("Сменить профиль") }
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(8.dp))
         }
         if (isLoading) {
             CenterMessage("Загружаю карточки Senkuro...")
@@ -1153,7 +1424,7 @@ private fun HomeScreen(
                     onPreviousPage = onPreviousPage,
                     onNextPage = onNextPage
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
                     modifier = Modifier.weight(1f),
@@ -1161,7 +1432,9 @@ private fun HomeScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    items(cards) { card -> CardTile(card) }
+                    items(cards, key = { "${it.id.ifBlank { it.imageUrl }}-${it.modifier}-${it.isShard}" }) { card ->
+                        CardTile(card = card, onClick = { onCardClick(card) })
+                    }
                 }
             }
         }
@@ -1202,115 +1475,437 @@ private fun CardPager(
 }
 
 @Composable
-private fun CardTile(card: CardItem) {
+private fun CardTile(card: CardItem, onClick: () -> Unit) {
     Card(
-        modifier = Modifier.height(330.dp),
+        onClick = onClick,
+        modifier = Modifier.height(292.dp),
         shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         border = BorderStroke(1.dp, rankColor(card.rank).copy(alpha = 0.8f))
     ) {
-        Column(modifier = Modifier.padding(10.dp)) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(210.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(MaterialTheme.colorScheme.background),
-                contentAlignment = Alignment.Center
-            ) {
-                if (card.isShard) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(8.dp)
+                .clip(RoundedCornerShape(17.dp))
+                .background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center
+        ) {
+            if (card.isShard) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(18.dp)
+                        .clip(shardShape)
+                        .background(rankColor(card.rank).copy(alpha = 0.8f))
+                        .padding(3.dp)
+                        .clip(shardShape)
+                ) {
+                    AsyncImage(
+                        model = card.imageUrl,
+                        contentDescription = "Осколок ${card.title}",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(20.dp)
-                            .clip(shardShape)
-                            .background(rankColor(card.rank).copy(alpha = 0.8f))
-                            .padding(3.dp)
-                            .clip(shardShape)
-                    ) {
-                        AsyncImage(
-                            model = card.imageUrl,
-                            contentDescription = "Осколок ${card.title}",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(
-                                    Brush.linearGradient(
-                                        listOf(
-                                            Color.White.copy(alpha = 0.22f),
-                                            Color.Transparent,
-                                            Color.Black.copy(alpha = 0.16f)
-                                        )
+                            .background(
+                                Brush.linearGradient(
+                                    listOf(
+                                        Color.White.copy(alpha = 0.22f),
+                                        Color.Transparent,
+                                        Color.Black.copy(alpha = 0.16f)
                                     )
                                 )
-                        )
-                    }
-                    Text(
-                        "ОСКОЛОК",
-                        modifier = Modifier.align(Alignment.BottomStart).padding(8.dp),
-                        color = Color.White,
-                        fontWeight = FontWeight.Black,
-                        style = MaterialTheme.typography.labelSmall
+                            )
                     )
-                } else {
+                }
+                Text(
+                    "ОСКОЛОК",
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(10.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color.Black.copy(alpha = 0.62f))
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    color = Color.White,
+                    fontWeight = FontWeight.Black,
+                    style = MaterialTheme.typography.labelSmall
+                )
+            } else {
+                AsyncImage(
+                    model = card.imageUrl,
+                    contentDescription = card.title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.linearGradient(
+                            colorStops = arrayOf(
+                                0.0f to Color.Transparent,
+                                0.38f to Color.Transparent,
+                                0.48f to Color.White.copy(alpha = 0.08f),
+                                0.54f to Color.White.copy(alpha = 0.24f),
+                                0.61f to Color.White.copy(alpha = 0.06f),
+                                0.72f to Color.Transparent,
+                                1.0f to Color.Transparent
+                            ),
+                            start = Offset(0f, 650f),
+                            end = Offset(900f, 0f)
+                        )
+                    )
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(70.dp)
+                    .align(Alignment.BottomCenter)
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.42f))
+                        )
+                    )
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color.Black.copy(alpha = 0.72f))
+                    .padding(horizontal = 10.dp, vertical = 5.dp)
+            ) {
+                Text(
+                    text = card.rank,
+                    color = Color.White,
+                    fontWeight = FontWeight.Black,
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(9.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color.Black.copy(alpha = 0.66f))
+                    .padding(horizontal = 10.dp, vertical = 5.dp)
+            ) {
+                Text("x${card.count}", color = Color.White, fontWeight = FontWeight.Black)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CardOwnersScreen(
+    card: CardItem,
+    ownerPage: Int,
+    onOwnerPageChange: (Int) -> Unit,
+    onOwnerClick: (CardOwner) -> Unit,
+    onOpenProfile: (CardOwner) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var result by remember(card.slug) { mutableStateOf<CardOwnersResult?>(null) }
+    var loading by remember(card.slug) { mutableStateOf(true) }
+    var error by remember(card.slug) { mutableStateOf("") }
+
+    LaunchedEffect(card.slug) {
+        loading = true
+        error = ""
+        result = runCatching { loadCardOwners(card) }
+            .onFailure { error = "Не удалось загрузить владельцев. Проверьте сеть и повторите." }
+            .getOrNull()
+        loading = false
+    }
+
+    val owners = result?.owners.orEmpty()
+    val pageCount = ((owners.size + CARD_OWNERS_PAGE_SIZE - 1) / CARD_OWNERS_PAGE_SIZE).coerceAtLeast(1)
+    val effectivePage = ownerPage.coerceIn(0, pageCount - 1)
+    val visibleOwners = owners.drop(effectivePage * CARD_OWNERS_PAGE_SIZE).take(CARD_OWNERS_PAGE_SIZE)
+
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = rankColor(card.rank).copy(alpha = 0.12f)
+                ),
+                border = BorderStroke(1.dp, rankColor(card.rank).copy(alpha = 0.45f)),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
                     AsyncImage(
                         model = card.imageUrl,
                         contentDescription = card.title,
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.size(width = 92.dp, height = 126.dp).clip(RoundedCornerShape(16.dp))
                     )
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(card.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Black)
+                        Text("Ранг ${card.rank}", color = rankColor(card.rank), fontWeight = FontWeight.Bold)
+                        Text(
+                            if (card.isShard) "Осколки в открытых предложениях обмена" else "Владельцы и предложения обмена по активности",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(
-                            Brush.linearGradient(
-                                colorStops = arrayOf(
-                                    0.0f to Color.Transparent,
-                                    0.38f to Color.Transparent,
-                                    0.48f to Color.White.copy(alpha = 0.08f),
-                                    0.54f to Color.White.copy(alpha = 0.28f),
-                                    0.61f to Color.White.copy(alpha = 0.06f),
-                                    0.72f to Color.Transparent,
-                                    1.0f to Color.Transparent
-                                ),
-                                start = Offset(0f, 650f),
-                                end = Offset(900f, 0f)
-                            )
-                        )
-                )
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(52.dp)
-                        .align(Alignment.BottomCenter)
-                        .background(
-                            Brush.verticalGradient(
-                                listOf(Color.Transparent, Color.White.copy(alpha = 0.10f))
-                            )
-                        )
-                )
-                AssistChip(
-                    onClick = {},
-                    label = { Text(card.rank, fontWeight = FontWeight.Bold) },
-                    modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)
-                )
             }
-            Spacer(Modifier.height(8.dp))
-            Box(modifier = Modifier.fillMaxWidth().height(48.dp)) {
+        }
+        when {
+            loading -> item {
+                Box(Modifier.fillMaxWidth().height(180.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            }
+            error.isNotBlank() -> item { Text(error, color = MaterialTheme.colorScheme.error) }
+            result?.owners.isNullOrEmpty() -> item {
                 Text(
-                    card.title,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    fontWeight = FontWeight.Bold
+                    if (card.isShard) {
+                        "Сейчас нет открытых предложений этого осколка и подтверждённых недавних владельцев. Полный список держателей осколков Senkuro не публикует."
+                    } else {
+                        "Senkuro пока не вернул открытый список владельцев или предложений этой карты."
+                    }
                 )
             }
-            Text("x${card.count}", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+            else -> {
+                item {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(Icons.Rounded.People, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Text(
+                            "Найдено: ${owners.size} · лимит $CARD_OWNERS_MAX_RESULTS",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Black
+                        )
+                    }
+                }
+                if (pageCount > 1) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            repeat(pageCount.coerceAtMost(5)) { page ->
+                                TextButton(
+                                    onClick = { onOwnerPageChange(page) },
+                                    colors = ButtonDefaults.textButtonColors(
+                                        containerColor = if (effectivePage == page) MaterialTheme.colorScheme.primaryContainer else Color.Transparent
+                                    )
+                                ) {
+                                    Text("${page + 1}", fontWeight = FontWeight.Black)
+                                }
+                            }
+                        }
+                    }
+                }
+                items(visibleOwners, key = { it.id }) { owner ->
+                    Card(
+                        onClick = { onOwnerClick(owner) },
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            if (owner.avatarUrl.isNotBlank()) {
+                                AsyncImage(
+                                    model = owner.avatarUrl,
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.size(54.dp).clip(CircleShape)
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier.size(54.dp).clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(owner.name.take(1).uppercase(), fontWeight = FontWeight.Black)
+                                }
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(owner.name, fontWeight = FontWeight.Black, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    "Уровень ${owner.level} · ${formatLastOnline(owner.lastOnlineAt)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                if (owner.tradeReady) {
+                                    Text(
+                                        "Есть предложение обмена",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color(0xFF66BB6A),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                            IconButton(onClick = { onOpenProfile(owner) }) {
+                                Icon(Icons.Rounded.OpenInNew, contentDescription = "Открыть профиль ${owner.name}")
+                            }
+                        }
+                    }
+                }
+                if (pageCount > 1) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedButton(
+                                onClick = { onOwnerPageChange(effectivePage - 1) },
+                                enabled = effectivePage > 0,
+                                modifier = Modifier.weight(1f)
+                            ) { Text("Назад") }
+                            Text("${effectivePage + 1} / $pageCount", fontWeight = FontWeight.Black)
+                            Button(
+                                onClick = { onOwnerPageChange(effectivePage + 1) },
+                                enabled = effectivePage < pageCount - 1,
+                                modifier = Modifier.weight(1f)
+                            ) { Text("Далее") }
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+@Composable
+private fun OwnerCardScreen(
+    card: CardItem,
+    owner: CardOwner,
+    onOpenProfile: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (owner.avatarUrl.isNotBlank()) {
+            AsyncImage(
+                model = owner.avatarUrl,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.size(72.dp).clip(CircleShape)
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(owner.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Black)
+        Text(
+            "${owner.slug} · уровень ${owner.level}",
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(22.dp))
+        Card(
+            shape = RoundedCornerShape(28.dp),
+            colors = CardDefaults.cardColors(containerColor = rankColor(card.rank).copy(alpha = 0.13f)),
+            border = BorderStroke(1.dp, rankColor(card.rank).copy(alpha = 0.65f))
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                AsyncImage(
+                    model = card.imageUrl,
+                    contentDescription = card.title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(width = 190.dp, height = 270.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                )
+                Spacer(Modifier.height(14.dp))
+                Text(card.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Black)
+                Text("Ранг ${card.rank}", color = rankColor(card.rank), fontWeight = FontWeight.Bold)
+            }
+        }
+        Spacer(Modifier.height(18.dp))
+        Surface(
+            color = Color(0xFF2E7D32).copy(alpha = 0.16f),
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, Color(0xFF66BB6A).copy(alpha = 0.5f))
+        ) {
+            Text(
+                if (card.isShard) "Осколок есть у пользователя" else "Есть в коллекции пользователя",
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                color = Color(0xFF66BB6A),
+                fontWeight = FontWeight.Black
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            if (owner.tradeReady) "Найдено в активном предложении обмена Senkuro" else "Подтверждено открытым списком владельцев Senkuro",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(14.dp))
+        Button(onClick = onOpenProfile, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Rounded.OpenInNew, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Открыть профиль и коллекцию")
+        }
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun ProfileWebScreen(owner: CardOwner, modifier: Modifier = Modifier) {
+    val profileUrl = remember(owner.slug) { normalizeProfileUrl(owner.slug) }
+    AndroidView(
+        modifier = modifier.fillMaxSize(),
+        factory = { context ->
+            WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.loadsImagesAutomatically = true
+                CookieManager.getInstance().setAcceptCookie(true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        val target = request.url
+                        return if (target.host == "senkuro.me" || target.host?.endsWith(".senkuro.me") == true) {
+                            false
+                        } else {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, target))
+                            true
+                        }
+                    }
+                }
+                loadUrl(profileUrl)
+            }
+        },
+        update = { webView ->
+            if (webView.url != profileUrl && webView.url.isNullOrBlank()) webView.loadUrl(profileUrl)
+        },
+        onRelease = { webView ->
+            webView.stopLoading()
+            webView.loadUrl("about:blank")
+            webView.removeAllViews()
+            webView.destroy()
+        }
+    )
+}
+
+private fun formatLastOnline(value: String): String {
+    val date = value.substringBefore('T')
+    val time = value.substringAfter('T', "").take(5)
+    val parts = date.split('-')
+    return if (parts.size == 3 && time.length == 5) "онлайн ${parts[2]}.${parts[1]} в $time" else "активность неизвестна"
 }
 
 private val shardShape = GenericShape { size, _ ->
@@ -1334,536 +1929,412 @@ private fun FarmScreen(
     onFarmingChange: (Boolean, String, Int, Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var currentUrl by remember { mutableStateOf("https://senkuro.me/") }
-    var farmWebView by remember { mutableStateOf<WebView?>(null) }
-    var delay by remember { mutableFloatStateOf(3f) }
-    var controlsExpanded by remember { mutableStateOf(false) }
-    var pauseSiteRendering by remember { mutableStateOf(false) }
+    if (!isVisible) {
+        Box(modifier = modifier.fillMaxSize())
+        return
+    }
 
-    LaunchedEffect(isFarming) {
-        if (isFarming) {
-            controlsExpanded = false
-            delay(2_000)
-            pauseSiteRendering = true
-        } else {
-            pauseSiteRendering = false
-            delay(250)
-            val webView = farmWebView ?: return@LaunchedEffect
-            val restoredUrl = farmProgress.url.takeIf(::isReaderPageUrl)
-            if (restoredUrl != null &&
-                normalizeReaderLocation(webView.url.orEmpty()) != normalizeReaderLocation(restoredUrl)
-            ) {
-                webView.loadUrl(restoredUrl)
-                delay(1_200)
-            }
-            if (farmProgress.max > 0) {
-                webView.evaluateJavascript(syncFarmProgressScript(farmProgress), null)
+    val context = LocalContext.current
+    val dark = MaterialTheme.colorScheme.background == Color(0xFF0C0D12)
+    val farmCardColor = if (dark) Color(0xFF211D38).copy(alpha = 0.92f) else Color.White.copy(alpha = 0.94f)
+    val farmSelectedColor = if (dark) Color(0xFF3A2D62) else Color(0xFFE8DEFF)
+    val farmBorderColor = if (dark) Color(0xFF66558C) else Color(0xFFD4C7FF)
+    val scope = rememberCoroutineScope()
+    var token by remember { mutableStateOf(SenkuroApi.loadAccessToken(context)) }
+    var viewer by remember { mutableStateOf<ViewerInfo?>(null) }
+    var mangaList by remember { mutableStateOf<List<ApiManga>>(emptyList()) }
+    var selectedManga by remember { mutableStateOf<ApiManga?>(null) }
+    var chapters by remember { mutableStateOf<List<ApiChapter>>(emptyList()) }
+    var selectedChapter by remember { mutableStateOf<ApiChapter?>(null) }
+    var delaySeconds by remember { mutableIntStateOf(60) }
+    var loading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    fun refreshToken() {
+        SenkuroApi.extractAccessToken(context)?.takeIf { it.isNotBlank() }?.let {
+            SenkuroApi.saveAccessToken(context, it)
+            token = it
+        }
+    }
+
+    LaunchedEffect(isVisible) {
+        refreshToken()
+        if (token.isBlank()) return@LaunchedEffect
+        if (viewer == null || mangaList.isEmpty()) {
+            val cached = loadCachedFarmManga(context)
+            if (cached.isNotEmpty()) mangaList = cached
+            loading = cached.isEmpty()
+            error = null
+            withContext(Dispatchers.IO) {
+                val v = SenkuroApi.fetchViewer(token)
+                val list = if (cached.isEmpty()) {
+                    val popular = SenkuroApi.fetchPopularManga(token).take(10)
+                    SenkuroApi.resolveMangaBatch(token, popular.map { it.slug }).take(10).ifEmpty { popular }
+                } else cached
+                withContext(Dispatchers.Main) {
+                    viewer = v
+                    mangaList = list
+                    if (list.isNotEmpty()) saveCachedFarmManga(context, list)
+                    loading = false
+                    if (v == null) error = "Не удалось загрузить аккаунт. Обновите авторизацию."
+                }
             }
         }
     }
 
-    LaunchedEffect(isVisible, pauseSiteRendering, farmWebView) {
-        val webView = farmWebView ?: return@LaunchedEffect
-        while (isVisible && !pauseSiteRendering) {
-            webView.evaluateJavascript("location.href") { rawUrl ->
-                cleanJsString(rawUrl)
-                    .takeIf { it.startsWith("https://senkuro.me/") }
-                    ?.let { currentUrl = it }
+    LaunchedEffect(selectedManga?.branchId) {
+        val manga = selectedManga ?: return@LaunchedEffect
+        if (manga.branchId.isBlank()) return@LaunchedEffect
+        selectedChapter = null
+        val cached = loadCachedFarmChapters(context, manga.branchId)
+        if (cached.isNotEmpty()) chapters = cached
+        loading = cached.isEmpty()
+        error = null
+        withContext(Dispatchers.IO) {
+            val loaded = cached.ifEmpty {
+                SenkuroApi.fetchChapters(token, manga.branchId)
+                    .filter { it.id.isNotBlank() && it.number > 0 }
+                    .distinctBy { it.id }
+                    .sortedBy { it.number }
             }
-            delay(1_000)
+            withContext(Dispatchers.Main) {
+                chapters = loaded
+                if (loaded.isNotEmpty()) saveCachedFarmChapters(context, manga.branchId, loaded)
+                loading = false
+                if (loaded.isEmpty()) error = "Главы не найдены"
+            }
         }
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
-        FarmSiteWebView(
-            isFarming = isFarming,
-            isVisible = isVisible,
-            delaySeconds = delay.toInt(),
-            farmProgress = farmProgress,
-            onUrlChanged = { currentUrl = it },
-            onWebViewReady = { farmWebView = it },
-            renderSite = !pauseSiteRendering,
-            modifier = Modifier.fillMaxSize()
+    if (isFarming) {
+        FarmingActiveScreen(
+            message = farmMessage.ifBlank { "Фарм работает" },
+            progress = farmProgress,
+            onStop = { onFarmingChange(false, "", 0, delaySeconds) },
+            modifier = modifier
         )
+        return
+    }
 
-        if (isVisible && isFarming) {
-            FarmingActiveScreen(
-                farmProgress = farmProgress,
-                farmMessage = farmMessage,
-                onStop = {
-                    onFarmingChange(false, currentUrl, 1, delay.toInt())
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-        } else if (isVisible && controlsExpanded) {
-            Card(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .padding(12.dp),
-                shape = RoundedCornerShape(26.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f))
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Button(
-                        onClick = { controlsExpanded = false },
-                        modifier = Modifier.align(Alignment.CenterHorizontally),
-                        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 4.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                            contentColor = MaterialTheme.colorScheme.primary
+    LazyColumn(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(horizontal = 20.dp, vertical = 18.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            if (selectedManga != null) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedButton(onClick = {
+                        selectedManga = null
+                        selectedChapter = null
+                        chapters = emptyList()
+                        error = null
+                    }) { Text("Назад") }
+                    Text(
+                        text = selectedManga?.title.orEmpty(),
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Black,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            } else {
+                Text("Фарм", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Black)
+            }
+        }
+
+        viewer?.let { v ->
+            item {
+                FarmGlassCard {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                        AnimatedAvatar(
+                            url = v.avatarUrl,
+                            modifier = Modifier.size(58.dp)
                         )
-                    ) { Text("⌄") }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        AssistChip(onClick = {}, label = { Text(if (isFarming) "Фарм работает" else "Фарм остановлен") })
-                        Spacer(Modifier.weight(1f))
-                        Text("${delay.toInt()} сек", fontWeight = FontWeight.Bold)
-                    }
-                    Slider(value = delay, onValueChange = { delay = it }, valueRange = 1f..15f, steps = 13)
-                    Button(
-                        onClick = {
-                            if (isFarming) {
-                                onFarmingChange(false, currentUrl, 1, delay.toInt())
-                            } else {
-                                farmWebView?.evaluateJavascript("location.href") { rawUrl ->
-                                    val actualUrl = cleanJsString(rawUrl)
-                                    currentUrl = actualUrl
-                                    if (isReaderPageUrl(actualUrl)) {
-                                        onFarmingChange(true, actualUrl, 1, delay.toInt())
-                                    }
-                                }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Text("Аккаунт", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Black)
+                                if (v.level > 0) LevelBadge(level = v.level)
                             }
-                        },
-                        enabled = isFarming || farmWebView != null,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isFarming) Color(0xFFE5484D) else Color(0xFF2FB344)
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(if (isFarming) Icons.Rounded.Stop else Icons.Rounded.PlayArrow, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text(if (isFarming) "Стоп" else "Старт")
-                    }
-                    Text("URL: $currentUrl", style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (!isFarming && !isReaderPageUrl(currentUrl)) {
-                        Text(
-                            "Откройте конкретную главу перед запуском.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
-                    if (farmMessage.isNotBlank()) {
-                        Text(farmMessage, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    }
-                    if (isFarming) {
-                        Text(
-                            "Фоновая WebView: шаг ${farmProgress.ticks}, позиция ${farmProgress.position}/${farmProgress.max}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                            Text("Почта: ${v.email}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("Профиль: ${v.slug.ifBlank { "—" }}")
+                            Text("Страна: ${v.country.ifBlank { "—" }}")
+                        }
                     }
                 }
             }
-        } else if (isVisible) {
-            Button(
-                onClick = { controlsExpanded = true },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 96.dp),
-                contentPadding = PaddingValues(horizontal = 22.dp, vertical = 6.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.92f),
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                )
-            ) { Text("⌃") }
         }
+
+        if (token.isBlank()) {
+            item {
+                FarmGlassCard {
+                    Text("Нет авторизации", fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Откройте вход, авторизуйтесь и вернитесь на эту вкладку.")
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = { refreshToken() }) { Text("Проверить авторизацию") }
+                }
+            }
+            return@LazyColumn
+        }
+
+        error?.let { msg -> item { Text(msg, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold) } }
+        if (loading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+
+        if (selectedManga == null) {
+            item { Text("Последние 10 книг", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Black) }
+            if (mangaList.isEmpty() && !loading) {
+                item {
+                    Button(onClick = {
+                        loading = true
+                        error = null
+                        scope.launch(Dispatchers.IO) {
+                            val popular = SenkuroApi.fetchPopularManga(token).take(10)
+                            val resolved = SenkuroApi.resolveMangaBatch(token, popular.map { it.slug }).take(10)
+                            val list = resolved.ifEmpty { popular }
+                            withContext(Dispatchers.Main) {
+                                mangaList = list
+                                saveCachedFarmManga(context, list)
+                                loading = false
+                            }
+                        }
+                    }) { Text("Загрузить книги") }
+                }
+            }
+            items(mangaList) { manga ->
+                Card(
+                    onClick = { selectedManga = manga },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, farmBorderColor),
+                    colors = CardDefaults.cardColors(containerColor = farmCardColor)
+                ) {
+                    Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(manga.title, fontWeight = FontWeight.Black, style = MaterialTheme.typography.titleMedium)
+                        Text("/${manga.slug}", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        } else {
+            item { Text("Главы", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Black) }
+            item {
+                FarmGlassCard {
+                    Text("Запуск", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Black)
+                    Spacer(Modifier.height(10.dp))
+                    Text("Задержка между попытками: ${delaySeconds} сек")
+                    Slider(
+                        value = delaySeconds.toFloat(),
+                        onValueChange = { delaySeconds = it.toInt().coerceIn(10, 300) },
+                        valueRange = 10f..300f,
+                        steps = 28
+                    )
+                    Button(
+                        enabled = selectedChapter != null && selectedManga?.branchId?.isNotBlank() == true,
+                        onClick = {
+                            context.getSharedPreferences("senkuro_farm", Context.MODE_PRIVATE).edit()
+                                .putInt("claim_delay_seconds", delaySeconds)
+                                .apply()
+                            val manga = selectedManga ?: return@Button
+                            val chapter = selectedChapter ?: return@Button
+                            startFarmService(context, manga, chapter, delaySeconds)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(22.dp)
+                    ) {
+                        Text(selectedChapter?.let { "Запустить: глава ${it.number}" } ?: "Выберите главу")
+                    }
+                }
+            }
+            items(chapters) { chapter ->
+                val selected = selectedChapter?.id == chapter.id
+                Card(
+                    onClick = { selectedChapter = chapter },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(22.dp),
+                    border = BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary else farmBorderColor),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (selected) farmSelectedColor else farmCardColor
+                    )
+                ) {
+                    Row(
+                        Modifier.padding(16.dp).fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Глава ${chapter.number}", fontWeight = FontWeight.Black)
+                        if (selected) Text("Выбрана", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AnimatedAvatar(url: String, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val imageLoader = remember {
+        ImageLoader.Builder(context)
+            .components {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    add(ImageDecoderDecoder.Factory())
+                } else {
+                    add(GifDecoder.Factory())
+                }
+            }
+            .build()
+    }
+    AsyncImage(
+        model = url,
+        imageLoader = imageLoader,
+        contentDescription = "Аватар профиля",
+        contentScale = ContentScale.Crop,
+        modifier = modifier
+            .clip(CircleShape)
+            .background(Brush.linearGradient(listOf(Color(0xFF9D7BFF), Color(0xFFFFC857))))
+    )
+}
+
+@Composable
+private fun LevelBadge(level: Int) {
+    val colors = levelBadgeColors(level)
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(Color(0xFF2B2B2E))
+            .padding(end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(Brush.linearGradient(colors))
+                .padding(horizontal = 10.dp, vertical = 3.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(level.toString(), color = Color.White, fontWeight = FontWeight.Black, style = MaterialTheme.typography.labelLarge)
+        }
+        Spacer(Modifier.width(5.dp))
+        Text("ур.", color = Color(0xFFD7D1EA), fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelLarge)
+    }
+}
+
+private fun levelBadgeColors(level: Int): List<Color> = when (level) {
+    in 1..5 -> listOf(Color(0xFF28C83A), Color(0xFF20B832))
+    in 6..10 -> listOf(Color(0xFF5E86FF), Color(0xFF4977F2))
+    in 11..15 -> listOf(Color(0xFFFFBD18), Color(0xFFFFA800))
+    in 16..20 -> listOf(Color(0xFFFF5967), Color(0xFFFF3F4C))
+    in 21..30 -> listOf(Color(0xFFC65CFF), Color(0xFFE95CCB))
+    in 31..35 -> listOf(Color(0xFF35B8FF), Color(0xFF2AA3F2))
+    in 36..40 -> listOf(Color(0xFF8D5BFF), Color(0xFF6F45E8))
+    in 41..45 -> listOf(Color(0xFFFFB24A), Color(0xFFFF9234))
+    in 46..50 -> listOf(Color(0xFF31C84C), Color(0xFF21A93A))
+    in 51..55 -> listOf(Color(0xFF6E8BFF), Color(0xFF4B72FF))
+    in 56..60 -> listOf(Color(0xFFFFC21A), Color(0xFFFFAA00))
+    in 61..65 -> listOf(Color(0xFFFF5967), Color(0xFF5DA3FF))
+    in 66..70 -> listOf(Color(0xFFAA5CFF), Color(0xFF7B45EE))
+    in 71..75 -> listOf(Color(0xFFFF87B7), Color(0xFFFF6E9C))
+    else -> listOf(Color(0xFF9D7BFF), Color(0xFFFFC857))
+}
+
+@Composable
+private fun FarmGlassCard(content: @Composable ColumnScope.() -> Unit) {
+    val dark = MaterialTheme.colorScheme.background == Color(0xFF0C0D12)
+    val container = if (dark) Color(0xFF161524).copy(alpha = 0.94f) else Color.White.copy(alpha = 0.92f)
+    val border = if (dark) Color(0xFF66558C) else Color(0xFFD4C7FF)
+    Card(
+        shape = RoundedCornerShape(26.dp),
+        border = BorderStroke(1.dp, border),
+        colors = CardDefaults.cardColors(containerColor = container),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(18.dp), content = content)
     }
 }
 
 @Composable
 private fun FarmingActiveScreen(
-    farmProgress: FarmProgress,
-    farmMessage: String,
+    message: String,
+    progress: FarmProgress,
     onStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Surface(
-        modifier = modifier,
-        color = MaterialTheme.colorScheme.background
+    val transition = rememberInfiniteTransition(label = "farm_spinner")
+    val rotation by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(animation = tween(1100, easing = LinearEasing), repeatMode = RepeatMode.Restart),
+        label = "farm_spinner_rotation"
+    )
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+        Card(
+            shape = RoundedCornerShape(34.dp),
+            border = BorderStroke(1.dp, Color(0xFF6D5A91)),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF15131F).copy(alpha = 0.96f)),
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Box(contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(112.dp),
-                    strokeWidth = 7.dp
-                )
-                Surface(
-                    modifier = Modifier.size(72.dp),
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.primaryContainer
+            Column(
+                modifier = Modifier.padding(26.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(86.dp)
+                        .clip(CircleShape)
+                        .background(Brush.linearGradient(listOf(Color(0xFF9D7BFF), Color(0xFFFFC857)))),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            Icons.Rounded.FlashOn,
-                            contentDescription = null,
-                            modifier = Modifier.size(38.dp),
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
+                    Icon(
+                        Icons.Rounded.Refresh,
+                        contentDescription = null,
+                        tint = Color(0xFF101018),
+                        modifier = Modifier.size(48.dp).graphicsLayer { rotationZ = rotation }
+                    )
+                }
+                Text("Фарм запущен", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Black)
+                Text(message, color = Color(0xFFD7D1EA), textAlign = TextAlign.Center)
+                FarmGlassCard {
+                    Text("Статистика сеанса", fontWeight = FontWeight.Black)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Прочитано: ${progress.reads}")
+                    Text("Попыток сбора: ${progress.claims}")
+                    Text("Карт получено: ${progress.drops}")
+                    Text("Ошибок: ${progress.errors}")
+                }
+                Button(
+                    onClick = onStop,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF9D7BFF), contentColor = Color.White)
+                ) {
+                    Text("Остановить фарм")
                 }
             }
-            Spacer(Modifier.height(28.dp))
-            Text(
-                "Фарм работает",
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Black
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "Сайт временно скрыт для снижения нагрузки",
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center
-            )
-            Spacer(Modifier.height(24.dp))
-            Card(
-                shape = RoundedCornerShape(22.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                )
-            ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text(
-                        "Шаг ${farmProgress.ticks}",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        "Карт за сессию: ${farmProgress.sessionCards}",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        "Позиция ${farmProgress.position}/${farmProgress.max}",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    if (farmMessage.isNotBlank()) {
-                        Text(
-                            farmMessage,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            textAlign = TextAlign.Center,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                }
-            }
-            Spacer(Modifier.height(28.dp))
-            Button(
-                onClick = onStop,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE5484D))
-            ) {
-                Icon(Icons.Rounded.Stop, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text("Остановить фарм")
-            }
-            Spacer(Modifier.height(12.dp))
-            Text(
-                "После остановки книга откроется на текущем месте",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center
-            )
         }
     }
 }
 
 @Composable
-@SuppressLint("JavascriptInterface")
 private fun FarmSiteWebView(
-    isFarming: Boolean,
-    isVisible: Boolean,
-    delaySeconds: Int,
-    farmProgress: FarmProgress,
+    url: String,
+    isActive: Boolean,
+    progress: FarmProgress,
+    onProgressChanged: (FarmProgress) -> Unit,
     onUrlChanged: (String) -> Unit,
-    onWebViewReady: (WebView) -> Unit,
-    renderSite: Boolean,
+    onCardDetected: (String, String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val appContext = LocalContext.current.applicationContext
-    val mainHandler = remember { Handler(Looper.getMainLooper()) }
-    val lastVisibleSyncAt = remember { longArrayOf(0L) }
-    val lastAppliedDelay = remember { intArrayOf(-1) }
-    val lastFarmingState = remember { arrayOfNulls<Boolean>(1) }
-    val bridge = remember(onUrlChanged, appContext) {
-        FarmWebBridge(
-            mainHandler = mainHandler,
-            onUrlChanged = onUrlChanged,
-            onCardCollected = { name, rank ->
-                recordVisibleCard(appContext, name, rank)
-            }
-        )
+    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text("WebView-фарм отключён. Используется API-режим.")
     }
-    AndroidView(
-        modifier = modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp)),
-        factory = { context ->
-            restoreSenkuroCookies(context.applicationContext)
-            WebView(context).apply {
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                settings.databaseEnabled = true
-                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                addJavascriptInterface(bridge, "SenkuroFarm")
-                visibility = if (isVisible && renderSite) View.VISIBLE else View.GONE
-                webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                        view.loadUrl(request.url.toString())
-                        return true
-                    }
-
-                    override fun onPageFinished(view: WebView, url: String) {
-                        super.onPageFinished(view, url)
-                        saveSenkuroCookies(appContext)
-                        onUrlChanged(url)
-                        view.evaluateJavascript(farmReaderScript(false, delaySeconds), null)
-                        if (isFarming) {
-                            view.evaluateJavascript(existingCardCollectorScript(), null)
-                        }
-                    }
-                }
-                loadUrl(
-                    farmProgress.url
-                        .takeIf { it.startsWith("https://senkuro.me/") }
-                        ?: "https://senkuro.me/"
-                )
-                post { onWebViewReady(this) }
-            }
-        },
-        update = { webView ->
-            onWebViewReady(webView)
-            webView.visibility = if (isVisible && renderSite) View.VISIBLE else View.GONE
-            if (isVisible && renderSite) webView.onResume() else webView.onPause()
-            if (!renderSite) {
-                webView.evaluateJavascript(
-                    """
-                        window.__senkuroVisibleCollectorDispose &&
-                          window.__senkuroVisibleCollectorDispose();
-                        if (window.__senkuroFarmUrlTimer) {
-                          clearInterval(window.__senkuroFarmUrlTimer);
-                          window.__senkuroFarmUrlTimer = null;
-                        }
-                    """.trimIndent(),
-                    null
-                )
-                return@AndroidView
-            }
-            if (lastAppliedDelay[0] != delaySeconds) {
-                lastAppliedDelay[0] = delaySeconds
-                webView.evaluateJavascript(farmReaderScript(false, delaySeconds), null)
-            }
-            if (lastFarmingState[0] != isFarming) {
-                lastFarmingState[0] = isFarming
-                webView.evaluateJavascript(
-                    if (isFarming) existingCardCollectorScript()
-                    else "window.__senkuroVisibleCollectorDispose && window.__senkuroVisibleCollectorDispose();",
-                    null
-                )
-            }
-            val backgroundUrl = farmProgress.url.takeIf {
-                it.startsWith("https://senkuro.me/") && "/chapters/" in it
-            }
-            val visibleUrl = webView.url.orEmpty()
-            if (isFarming && isVisible && backgroundUrl != null &&
-                normalizeReaderLocation(visibleUrl) != normalizeReaderLocation(backgroundUrl)
-            ) {
-                webView.loadUrl(backgroundUrl)
-            } else if (isFarming && isVisible && farmProgress.max > 0) {
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastVisibleSyncAt[0] >= VISIBLE_FARM_SYNC_INTERVAL_MS) {
-                    lastVisibleSyncAt[0] = now
-                    webView.evaluateJavascript(syncFarmProgressScript(farmProgress), null)
-                }
-            }
-        }
-    )
 }
-
-private fun normalizeReaderLocation(url: String): String =
-    url.substringBefore('?').substringBefore('#')
-
-private fun isReaderPageUrl(url: String): Boolean =
-    url.startsWith("https://senkuro.me/") &&
-        Regex("/chapters/[^/]+/pages/\\d+").containsMatchIn(url)
-
-internal fun existingCardCollectorScript(): String = """
-    (function() {
-      window.__senkuroVisibleCollectorDispose && window.__senkuroVisibleCollectorDispose();
-      let reported = false;
-      let state = 'idle';
-      const visible = element => {
-        if (!element || !element.isConnected) return false;
-        const rect = element.getBoundingClientRect();
-        const style = getComputedStyle(element);
-        return rect.width > 3 && rect.height > 3 &&
-          style.display !== 'none' && style.visibility !== 'hidden';
-      };
-      const findDrop = () => [
-        ...document.querySelectorAll(
-          'img.cards-drop, .cards-drop, [class*="cards-drop"], ' +
-          '[class*="CardDrop"]:not([class*="Modal"]), [data-card-drop]'
-        )
-      ].find(element => visible(element) && !element.closest(
-        '.modal-container-drop, [class*="CardDropModal"], [role="dialog"]'
-      ));
-      const findModal = () => {
-        const direct = document.querySelector(
-          '.modal-container-drop, [class*="CardDropModal"], [class*="card-drop-modal"]'
-        );
-        if (direct) return direct;
-        return [...document.querySelectorAll('[role="dialog"]')]
-          .find(dialog => dialog.querySelector('.collectible-card'));
-      };
-      const dispatchClick = element => {
-        const target = element?.closest('button, a, [role="button"]') || element;
-        if (!target) return;
-        const rect = target.getBoundingClientRect();
-        const x = Math.floor(rect.left + rect.width / 2);
-        const y = Math.floor(rect.top + rect.height / 2);
-        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-          target.dispatchEvent(new MouseEvent(type, {
-            bubbles: true, cancelable: true, clientX: x, clientY: y
-          }));
-        }
-      };
-      const check = () => {
-        const modal = findModal();
-        if (modal) {
-          const cardName =
-            modal.querySelector('.collectible-card__front img')?.getAttribute('alt') ||
-            modal.querySelector('.collectible-card img')?.getAttribute('alt') ||
-            modal.querySelector('img[alt]')?.getAttribute('alt') ||
-            'Карточка';
-          const cardLink = modal.querySelector('a.collectible-card')?.getAttribute('href') || '';
-          const rankMatch = cardLink.match(/-((?:sr)|[sabcdef])$/i);
-          const cardRank =
-            modal.querySelector('[data-rank]')?.getAttribute('data-rank') ||
-            rankMatch?.[1]?.toUpperCase() ||
-            '?';
-          const x = Math.floor(window.innerWidth / 2);
-          const y = Math.max(1, window.innerHeight - 12);
-          dispatchClick(document.elementFromPoint(x, y) || modal);
-          if (!reported && window.SenkuroFarm?.onCardCollected) {
-            reported = true;
-            window.SenkuroFarm.onCardCollected(cardName, cardRank);
-          }
-          state = 'closing';
-          return;
-        }
-        if (state === 'closing') {
-          state = 'idle';
-          reported = false;
-        }
-        const drop = findDrop();
-        if (drop && state !== 'opening') {
-          state = 'opening';
-          dispatchClick(drop);
-        } else if (!drop && state === 'opening') {
-          state = 'idle';
-        }
-      };
-      let queued = false;
-      const observer = new MutationObserver(function() {
-        if (queued) return;
-        queued = true;
-        requestAnimationFrame(function() {
-          queued = false;
-          check();
-        });
-      });
-      observer.observe(document.documentElement, { childList: true, subtree: true });
-      const timer = setInterval(check, 350);
-      window.__senkuroVisibleCollectorDispose = function() {
-        observer.disconnect();
-        clearInterval(timer);
-      };
-      check();
-    })();
-""".trimIndent()
-
-private fun syncFarmProgressScript(progress: FarmProgress): String {
-    val ratio = (progress.position.toDouble() / progress.max.coerceAtLeast(1).toDouble())
-        .coerceIn(0.0, 1.0)
-    return """
-        (function() {
-          const root = document.scrollingElement || document.documentElement;
-          const max = Math.max(0, root.scrollHeight - window.innerHeight);
-          window.scrollTo({
-            top: Math.floor(max * $ratio),
-            behavior: 'smooth'
-          });
-        })();
-    """.trimIndent()
-}
-
-private fun farmReaderScript(isFarming: Boolean, delaySeconds: Int): String = """
-    (function() {
-      if (window.SenkuroFarm && window.SenkuroFarm.onUrlChanged) {
-        window.SenkuroFarm.onUrlChanged(location.href);
-      }
-      if (window.__senkuroFarmUrlTimer) clearInterval(window.__senkuroFarmUrlTimer);
-      window.__senkuroFarmUrlTimer = setInterval(function() {
-        if (window.SenkuroFarm && window.SenkuroFarm.onUrlChanged) window.SenkuroFarm.onUrlChanged(location.href);
-      }, 1000);
-      if (window.__senkuroFarmTimer) clearInterval(window.__senkuroFarmTimer);
-      window.__senkuroFarmRunId = (window.__senkuroFarmRunId || 0) + 1;
-      if (!${isFarming}) return;
-      const runId = window.__senkuroFarmRunId;
-      window.__senkuroFarmScrolling = false;
-      const scrollLikeReading = function() {
-        if (window.__senkuroFarmScrolling) return;
-        const max = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) - window.innerHeight;
-        const step = Math.max(180, Math.floor(window.innerHeight * 0.55));
-        const start = window.scrollY;
-        const target = window.scrollY >= max - 20 ? 0 : Math.min(max, start + step);
-        const duration = Math.min(900, Math.max(350, ${delaySeconds.coerceAtLeast(1) * 350}));
-        const startedAt = performance.now();
-        window.__senkuroFarmScrolling = true;
-        const animate = function(now) {
-          if (runId !== window.__senkuroFarmRunId) {
-            window.__senkuroFarmScrolling = false;
-            return;
-          }
-          const progress = Math.min(1, (now - startedAt) / duration);
-          const eased = 1 - Math.pow(1 - progress, 3);
-          window.scrollTo(0, start + (target - start) * eased);
-          if (progress < 1) requestAnimationFrame(animate);
-          else window.__senkuroFarmScrolling = false;
-        };
-        requestAnimationFrame(animate);
-      };
-      window.__senkuroFarmTimer = setInterval(function() {
-        scrollLikeReading();
-      }, ${delaySeconds.coerceAtLeast(1) * 1000});
-    }
-)();
-""".trimIndent()
 
 @Composable
 private fun StatisticsScreen(
@@ -1989,9 +2460,14 @@ private fun formatRuntime(milliseconds: Long): String {
 }
 
 @Composable
-private fun SettingsScreen(darkTheme: Boolean, onDarkThemeChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {
+private fun SettingsScreen(
+    darkTheme: Boolean,
+    onDarkThemeChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
     val context = LocalContext.current
     var persistentNotification by remember { mutableStateOf(true) }
+    var resetDone by remember { mutableStateOf(false) }
     val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     LazyColumn(modifier = modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -2014,6 +2490,24 @@ private fun SettingsScreen(darkTheme: Boolean, onDarkThemeChange: (Boolean) -> U
                         notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                     }
                 }) { Text("Выдать разрешение на уведомления") }
+            }
+        }
+        item {
+            SectionCard("Статистика") {
+                Text("Сбросит общее время, счётчики фарма и полученные ботом карты.")
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        resetFarmStatistics(context)
+                        resetDone = true
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Сбросить статистику") }
+                if (resetDone) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("Статистика сброшена", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                }
             }
         }
         item {
@@ -2134,11 +2628,15 @@ private fun LicenseScreen(onBack: () -> Unit) {
 
 @Composable
 private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+    val dark = MaterialTheme.colorScheme.background == Color(0xFF0C0D12)
+    val container = if (dark) Color(0xFF161524).copy(alpha = 0.94f) else Color.White.copy(alpha = 0.92f)
+    val border = if (dark) Color(0xFF66558C) else Color(0xFFD4C7FF)
     Card(
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        shape = RoundedCornerShape(26.dp),
+        border = BorderStroke(1.dp, border),
+        colors = CardDefaults.cardColors(containerColor = container)
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
             Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Black)
             Spacer(Modifier.height(10.dp))
             content()
@@ -2208,7 +2706,7 @@ private fun showCardsPage(
 }
 
 private fun cardsCacheKey(profileUrl: String, page: Int): String =
-    "cards_v3_${normalizeProfileUrl(profileUrl).hashCode()}_$page"
+    "cards_v5_${normalizeProfileUrl(profileUrl).hashCode()}_$page"
 
 private fun loadCachedCardsPage(context: Context, profileUrl: String, page: Int): CachedCardsPage? {
     val raw = context.getSharedPreferences("senkuro_cards_cache", Context.MODE_PRIVATE)
@@ -2222,6 +2720,8 @@ private fun loadCachedCardsPage(context: Context, profileUrl: String, page: Int)
                 val item = items.getJSONObject(index)
                 add(
                     CardItem(
+                        id = item.optString("id"),
+                        slug = item.optString("slug"),
                         title = item.getString("title"),
                         rank = item.getString("rank"),
                         imageUrl = item.getString("imageUrl"),
@@ -2286,6 +2786,8 @@ private fun saveCachedCardsPage(
     cached.page.cards.forEach { card ->
         cards.put(
             JSONObject()
+                .put("id", card.id)
+                .put("slug", card.slug)
                 .put("title", card.title)
                 .put("rank", card.rank)
                 .put("imageUrl", card.imageUrl)
@@ -2371,6 +2873,7 @@ private fun loadProfileCardsGraphQl(profileUrl: String, after: String?): CardsPa
                 modifier
                 card {
                   id
+                  slug
                   titles { lang content }
                   rank
                   image { original { url } }
@@ -2388,17 +2891,11 @@ private fun loadProfileCardsGraphQl(profileUrl: String, after: String?): CardsPa
         .put("query", query)
         .put("variables", variables)
         .toString()
-    val request = Request.Builder()
-        .url(GRAPHQL_URL)
-        .header("User-Agent", "Mozilla/5.0 (Android) SenkuroFarm/1.0")
-        .header("Content-Type", "application/json")
-        .apply { if (cookie.isNotBlank()) header("Cookie", cookie) }
-        .post(payload.toRequestBody("application/json".toMediaType()))
-        .build()
-    val body = networkClient.newCall(request).execute().use { response ->
-        if (!response.isSuccessful) return null
-        response.body?.string().orEmpty()
+    val response = postGraphQl(payload, cookie)
+    if (response.code !in 200..299) {
+        return null
     }
+    val body = response.body
     val root = JSONObject(body)
     val userCards = root.optJSONObject("data")?.optJSONObject("userCards") ?: return null
     val edges = userCards.optJSONArray("edges") ?: return null
@@ -2415,6 +2912,8 @@ private fun loadProfileCardsGraphQl(profileUrl: String, after: String?): CardsPa
             if (title.isNotBlank() && imageUrl.isNotBlank() && rank != "?") {
                 add(
                     CardItem(
+                        id = card.optString("id"),
+                        slug = card.optString("slug"),
                         title = title,
                         rank = rank,
                         imageUrl = imageUrl,
@@ -2436,6 +2935,166 @@ private fun loadProfileCardsGraphQl(profileUrl: String, after: String?): CardsPa
     )
 }
 
+private suspend fun loadCardOwners(card: CardItem): CardOwnersResult = withContext(Dispatchers.IO) {
+    require(card.slug.isNotBlank() && card.id.isNotBlank()) { "Card identity is missing" }
+    val now = System.currentTimeMillis()
+    synchronized(cardOwnersCache) {
+        val iterator = cardOwnersCache.entries.iterator()
+        while (iterator.hasNext()) {
+            if (now - iterator.next().value.savedAt >= CARD_OWNERS_CACHE_TTL_MS) iterator.remove()
+        }
+        cardOwnersCache[card.slug]?.let { return@withContext it.result }
+    }
+
+    val query = """
+        query fetchCardOwners(${'$'}slug: String!, ${'$'}cardId: ID!) {
+          card(slug: ${'$'}slug) {
+            owners
+            newOwners {
+              id
+              idSlug
+              slug
+              name
+              level
+              lastOnlineAt
+              avatar { original { url } }
+            }
+          }
+          cardOffers(
+            first: 50,
+            offerCardId: ${'$'}cardId,
+            orderBy: { field: CREATED_AT, direction: DESC }
+          ) {
+            edges {
+              node {
+                user {
+                  id
+                  idSlug
+                  slug
+                  name
+                  level
+                  lastOnlineAt
+                  avatar { original { url } }
+                }
+                offer { cardId shard }
+              }
+            }
+          }
+        }
+    """.trimIndent()
+    val payload = JSONObject()
+        .put("query", query)
+        .put("variables", JSONObject().put("slug", card.slug).put("cardId", card.id))
+        .toString()
+    val cookie = CookieManager.getInstance().getCookie("https://senkuro.me").orEmpty()
+    val response = postGraphQl(payload, cookie)
+    check(response.code in 200..299) { "Card owners request failed: ${response.code}" }
+    val body = response.body
+    val data = JSONObject(body).optJSONObject("data") ?: error("Card owners response is empty")
+    val cardJson = data.optJSONObject("card")
+        ?: error("Card owners response is empty")
+    val ownersJson = cardJson.optJSONArray("newOwners") ?: org.json.JSONArray()
+    fun parseOwner(owner: JSONObject, tradeReady: Boolean): CardOwner? {
+        val id = owner.optString("id")
+        val slug = owner.optString("slug").ifBlank { owner.optString("idSlug") }
+        val name = owner.optString("name").ifBlank { slug }
+        if (id.isBlank() || slug.isBlank() || name.isBlank()) return null
+        return CardOwner(
+            id = id,
+            slug = slug,
+            name = name,
+            avatarUrl = owner.optJSONObject("avatar")
+                ?.optJSONObject("original")
+                ?.optString("url")
+                .orEmpty(),
+            lastOnlineAt = owner.optString("lastOnlineAt"),
+            level = owner.optInt("level"),
+            tradeReady = tradeReady
+        )
+    }
+
+    val mergedOwners = linkedMapOf<String, CardOwner>()
+    if (!card.isShard) {
+        for (index in 0 until ownersJson.length()) {
+            parseOwner(ownersJson.optJSONObject(index) ?: continue, tradeReady = false)?.let {
+                mergedOwners[it.id] = it
+            }
+        }
+    } else if (ownersJson.length() > 0) {
+        val recentOwners = (0 until ownersJson.length()).mapNotNull { ownersJson.optJSONObject(it) }
+        val definitions = recentOwners.indices.joinToString(", ") { "${'$'}user$it: ID!" }
+        val selections = recentOwners.indices.joinToString("\n") { index ->
+            """
+                u$index: userCards(
+                  first: 100,
+                  userId: ${'$'}user$index,
+                  orderBy: { field: CREATED_AT, direction: DESC }
+                ) { edges { node { cardId shard } } }
+            """.trimIndent()
+        }
+        val verificationQuery = "query verifyShardOwners($definitions) {\n$selections\n}"
+        val verificationVariables = JSONObject().apply {
+            recentOwners.forEachIndexed { index, owner -> put("user$index", owner.optString("id")) }
+        }
+        val verificationResponse = postGraphQl(
+            JSONObject().put("query", verificationQuery).put("variables", verificationVariables).toString(),
+            cookie
+        )
+        if (verificationResponse.code in 200..299) {
+            val verificationData = JSONObject(verificationResponse.body).optJSONObject("data")
+            recentOwners.forEachIndexed { index, ownerJson ->
+                val edges = verificationData?.optJSONObject("u$index")?.optJSONArray("edges")
+                    ?: org.json.JSONArray()
+                var hasShard = false
+                for (edgeIndex in 0 until edges.length()) {
+                    val userCard = edges.optJSONObject(edgeIndex)?.optJSONObject("node") ?: continue
+                    if (userCard.optString("cardId") == card.id && userCard.optBoolean("shard")) {
+                        hasShard = true
+                        break
+                    }
+                }
+                if (hasShard) {
+                    parseOwner(ownerJson, tradeReady = false)?.let { mergedOwners[it.id] = it }
+                }
+            }
+        }
+    }
+    val offerEdges = data.optJSONObject("cardOffers")?.optJSONArray("edges") ?: org.json.JSONArray()
+    for (index in 0 until offerEdges.length()) {
+        val node = offerEdges.optJSONObject(index)?.optJSONObject("node") ?: continue
+        val previews = node.optJSONArray("offer") ?: continue
+        var matchingPreview = false
+        for (previewIndex in 0 until previews.length()) {
+            val preview = previews.optJSONObject(previewIndex) ?: continue
+            if (preview.optString("cardId") == card.id && preview.optBoolean("shard") == card.isShard) {
+                matchingPreview = true
+                break
+            }
+        }
+        if (!matchingPreview) continue
+        parseOwner(node.optJSONObject("user") ?: continue, tradeReady = true)?.let { owner ->
+            val previous = mergedOwners[owner.id]
+            mergedOwners[owner.id] = if (previous == null) owner else previous.copy(tradeReady = true)
+        }
+    }
+    val owners = mergedOwners.values
+        .sortedWith(compareByDescending<CardOwner> { it.lastOnlineAt }.thenByDescending { it.level })
+        .take(CARD_OWNERS_MAX_RESULTS)
+    val result = CardOwnersResult(
+        owners = owners,
+        totalOwners = cardJson.optInt("owners", owners.size).coerceAtLeast(owners.size)
+    )
+    synchronized(cardOwnersCache) {
+        cardOwnersCache[card.slug] = CachedCardOwners(result, now)
+    }
+    Handler(Looper.getMainLooper()).postDelayed({
+        synchronized(cardOwnersCache) {
+            if (cardOwnersCache[card.slug]?.savedAt == now) cardOwnersCache.remove(card.slug)
+        }
+    }, CARD_OWNERS_CACHE_TTL_MS)
+    result
+}
+
 private fun resolveGraphQlUserId(profileUrl: String): String? {
     val profileSlug = extractProfileSlug(profileUrl) ?: return null
     graphQlUserIdCache[profileSlug]?.let { return it }
@@ -2451,20 +3110,14 @@ private fun resolveGraphQlUserId(profileUrl: String): String? {
         .put("query", query)
         .put("variables", JSONObject().put("slug", profileSlug))
         .toString()
-    val request = Request.Builder()
-        .url(GRAPHQL_URL)
-        .header("User-Agent", "Mozilla/5.0 (Android) SenkuroFarm/1.0")
-        .header("Content-Type", "application/json")
-        .post(payload.toRequestBody("application/json".toMediaType()))
-        .build()
-    return networkClient.newCall(request).execute().use { response ->
-        if (!response.isSuccessful) return null
-        JSONObject(response.body?.string().orEmpty())
-            .optJSONObject("data")
-            ?.optJSONObject("user")
-            ?.optString("id")
-            ?.takeIf { it.isNotBlank() }
-    }?.also { graphQlUserIdCache[profileSlug] = it }
+    val response = postGraphQl(payload, "")
+    if (response.code !in 200..299) return null
+    return JSONObject(response.body)
+        .optJSONObject("data")
+        ?.optJSONObject("user")
+        ?.optString("id")
+        ?.takeIf { it.isNotBlank() }
+        ?.also { graphQlUserIdCache[profileSlug] = it }
 }
 
 internal fun extractProfileSlug(profileUrl: String): String? =

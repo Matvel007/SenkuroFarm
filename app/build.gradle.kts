@@ -23,8 +23,8 @@ android {
         applicationId = "com.example.senkurofarm"
         minSdk = 24
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.0.3"
+        versionCode = 7
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -74,6 +74,7 @@ dependencies {
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.androidx.navigation.compose)
     implementation(libs.coil.compose)
+    implementation(libs.coil.gif)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.material)
     implementation(libs.okhttp)

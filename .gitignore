@@ -58,9 +58,23 @@ lint-results*
 # Local screenshots and debugging artifacts
 artifacts/
 screenshots/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
 
 # Local development instructions
 AGENTS.md
+
+# Local reference projects, generated JS tooling and backups
+/Senkuro/
+/backup_*/
+/node_modules/
+/package.json
+/package-lock.json
+/yarn.lock
+/pnpm-lock.yaml
 
 # Saved Senkuro web pages used during local investigation
 /*.html
