@@ -134,8 +134,13 @@ class FarmService : Service() {
             updateNotification("сбор карты")
             delay(3_000)
 
-            while (currentCoroutineContext().isActive) {
+            // Окно дропа живёт ~9 минут. Перечитываем через этот интервал.
+            val windowDeadline = System.currentTimeMillis() + 540_000L
+            var dropped = false
+            var lastWakeRefresh = System.currentTimeMillis()
+            while (currentCoroutineContext().isActive && System.currentTimeMillis() < windowDeadline) {
                 val now = System.currentTimeMillis()
+                if (now - lastWakeRefresh > 300_000L) { refreshWakeLock(); lastWakeRefresh = now }
                 if (now < cooldownUntil) {
                     delay((cooldownUntil - now).coerceAtMost(15_000))
                     continue
@@ -146,9 +151,12 @@ class FarmService : Service() {
                     ClaimResult.DROP -> {
                         drops++
                         saveProgress()
+                        val totalCards = getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_CARDS, 0) + 1
+                        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_CARDS, totalCards).apply()
                         saveRunning(true, "КАРТА! попытка #$claims")
                         updateNotification("карта!")
-                        Log.d(LOG_TAG, "CARD DROP reads=$reads claims=$claims drops=$drops")
+                        Log.d(LOG_TAG, "CARD DROP reads=$reads claims=$claims drops=$drops total=$totalCards")
+                        dropped = true
                         delay(2_000)
                         break
                     }
@@ -171,7 +179,8 @@ class FarmService : Service() {
                 saveProgress()
                 delay(claimDelaySeconds * 1000L)
             }
-            delay(2_000)
+            Log.d(LOG_TAG, "Re-reading: dropped=$dropped elapsed=${System.currentTimeMillis()-windowDeadline+540_000L}ms")
+            refreshWakeLock()
         }
     }
 
@@ -214,7 +223,18 @@ class FarmService : Service() {
     }
 
     private fun saveProgress() {
-        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // Периодически коммитим сессию в accumulated, чтобы не потерять при убийстве процесса
+        if (!sessionTimeCommitted && startedAt > 0L) {
+            val now = System.currentTimeMillis()
+            val sessionDelta = (now - startedAt).coerceAtLeast(0L)
+            if (sessionDelta > 60_000L) {
+                val acc = prefs.getLong(KEY_ACCUMULATED_RUNTIME_MS, 0L) + sessionDelta
+                prefs.edit().putLong(KEY_ACCUMULATED_RUNTIME_MS, acc).apply()
+                startedAt = now
+            }
+        }
+        prefs.edit()
             .putLong(KEY_READS, reads)
             .putLong(KEY_CLAIMS, claims)
             .putLong(KEY_DROPS, drops)
@@ -248,10 +268,18 @@ class FarmService : Service() {
     }
 
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        wakeLock = getSystemService(PowerManager::class.java)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$LOG_TAG:FarmWakeLock")
-            .apply { setReferenceCounted(false); acquire(10 * 60_000L) }
+        wakeLock = wakeLock?.takeIf { it.isHeld }
+            ?: getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$LOG_TAG:FarmWakeLock")
+                .apply { setReferenceCounted(false) }
+        if (wakeLock?.isHeld == false) {
+            wakeLock?.acquire(60 * 60_000L)
+        }
+    }
+
+    private fun refreshWakeLock() {
+        wakeLock?.takeIf { it.isHeld }?.release()
+        wakeLock?.acquire(60 * 60_000L)
     }
 
     private fun releaseWakeLock() {

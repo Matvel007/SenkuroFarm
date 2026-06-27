@@ -221,8 +221,7 @@ private data class FarmProgress(
 
 private data class FarmStatistics(
     val runtimeMs: Long = 0,
-    val botCards: Int = 0,
-    val botRanks: Map<String, Int> = emptyMap()
+    val botCards: Int = 0
 )
 
 private data class CardsPage(
@@ -262,7 +261,7 @@ private const val GRAPHQL_URL = "https://api.senkuro.me/graphql"
 private const val CARDS_CACHE_TTL_MS = 10 * 60 * 1000L
 private const val CARD_OWNERS_CACHE_TTL_MS = 5 * 60 * 1000L
 private const val CARD_OWNERS_CACHE_MAX_ENTRIES = 12
-private const val CARD_OWNERS_MAX_RESULTS = 50
+private const val CARD_OWNERS_MAX_RESULTS = 120
 private const val CARD_OWNERS_PAGE_SIZE = 10
 private const val VISIBLE_FARM_SYNC_INTERVAL_MS = 3_000L
 private val networkClient = OkHttpClient()
@@ -671,10 +670,7 @@ private fun loadFarmStatistics(context: Context): FarmStatistics {
     val preferences = context.getSharedPreferences(FarmService.PREFS, Context.MODE_PRIVATE)
     return FarmStatistics(
         runtimeMs = preferences.getLong(FarmService.KEY_TOTAL_RUNTIME_MS, 0L),
-        botCards = preferences.getInt(FarmService.KEY_SESSION_CARDS, 0),
-        botRanks = FarmService.CARD_RANKS.associateWith {
-            preferences.getInt(FarmService.botRankKey(it), 0)
-        }
+        botCards = preferences.getInt(FarmService.KEY_CARDS, 0)
     )
 }
 
@@ -691,7 +687,6 @@ private fun resetFarmStatistics(context: Context) {
         .putBoolean(FarmService.KEY_RUNNING, false)
         .putLong(FarmService.KEY_STARTED_AT, 0L)
         .putString(FarmService.KEY_LAST_MESSAGE, "")
-    FarmService.CARD_RANKS.forEach { editor.putInt(FarmService.botRankKey(it), 0) }
     editor.apply()
 }
 
@@ -1288,13 +1283,19 @@ private fun MainShell(
                     )
                 }
                 Tab.Farm -> Unit
-                Tab.Statistics -> StatisticsScreen(
-                    farmStatistics = farmStatistics,
-                    accountCardsTotal = accountCardsTotal,
-                    accountRankStats = accountRankStats,
-                    accountStatsLoading = accountStatsLoading,
-                    modifier = Modifier.zIndex(2f)
-                )
+                Tab.Statistics -> {
+                    val liveStats = remember { mutableStateOf(loadFarmStatistics(context)) }
+                    LaunchedEffect(selectedTab) {
+                        if (selectedTab == Tab.Statistics) liveStats.value = loadFarmStatistics(context)
+                    }
+                    StatisticsScreen(
+                        farmStatistics = liveStats.value,
+                        accountCardsTotal = accountCardsTotal,
+                        accountRankStats = accountRankStats,
+                        accountStatsLoading = accountStatsLoading,
+                        modifier = Modifier.zIndex(2f)
+                    )
+                }
                 Tab.Settings -> SettingsScreen(
                     darkTheme = darkTheme,
                     onDarkThemeChange = onDarkThemeChange,
@@ -2377,8 +2378,6 @@ private fun StatisticsScreen(
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
-                Spacer(Modifier.height(10.dp))
-                RankStatistics(farmStatistics.botRanks)
             }
         }
     }
@@ -2961,7 +2960,7 @@ private suspend fun loadCardOwners(card: CardItem): CardOwnersResult = withConte
             }
           }
           cardOffers(
-            first: 50,
+            first: 100,
             offerCardId: ${'$'}cardId,
             orderBy: { field: CREATED_AT, direction: DESC }
           ) {

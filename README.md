@@ -23,6 +23,7 @@
   <img src="3.jpg" width="205" alt="Экран фарма">
   <img src="1.jpg" width="205" alt="Статистика">
   <img src="2.jpg" width="205" alt="Настройки">
+  <img src="5.jpg" width="205" alt="Владельцы карты">
 </div>
 
 ## ✨ Возможности
