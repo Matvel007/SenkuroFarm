@@ -4,7 +4,7 @@
 
 # ⚡ Senkuro Farm
 
-**Android-приложение для просмотра коллекции карт, статистики, автоматического сбора карт и поиска владельцев на сайте senkuro.me**
+**Android-приложение для просмотра коллекции карт, статистики и автоматического сбора карт на сайте senkuro.me**
 
 [![Android](https://img.shields.io/badge/Android-7.0%2B-3DDC84?logo=android&logoColor=white)](https://www.android.com/)
 [![Kotlin](https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
@@ -32,7 +32,6 @@
   <img src="3.jpg" width="205" alt="Экран фарма">
   <img src="1.jpg" width="205" alt="Статистика">
   <img src="2.jpg" width="205" alt="Настройки">
-  <img src="5.jpg" width="205" alt="Владельцы карты">
 </div>
 
 ## ✨ Возможности
